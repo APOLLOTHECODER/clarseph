@@ -1,0 +1,3171 @@
+<?php
+declare(strict_types=1);
+
+function getVaultSecret(): string {
+    $keyFile = rtrim(sys_get_temp_dir(), '/\\') . DIRECTORY_SEPARATOR . 'holo_flower_vault_' . substr(md5(__FILE__), 0, 12) . '.key';
+    if (is_file($keyFile) && is_readable($keyFile)) {
+        $val = trim((string) @file_get_contents($keyFile));
+        if (strlen($val) >= 32) {
+            return $val;
+        }
+    }
+    $generated = bin2hex(random_bytes(32));
+    @file_put_contents($keyFile, $generated, LOCK_EX);
+    if (is_file($keyFile) && is_readable($keyFile)) {
+        $val = trim((string) @file_get_contents($keyFile));
+        if (strlen($val) >= 32) {
+            return $val;
+        }
+    }
+    return hash('sha256', __FILE__ . '|' . php_uname('n') . '|' . (string) @fileinode(__FILE__));
+}
+
+function makeVaultToken(string $secret): string {
+    $exp = time() + 86400;
+    return $exp . '.' . hash_hmac('sha256', (string) $exp, $secret);
+}
+
+function verifyVaultToken(string $secret): bool {
+    $token = '';
+    if (isset($_SERVER['HTTP_X_VAULT_TOKEN'])) {
+        $token = (string) $_SERVER['HTTP_X_VAULT_TOKEN'];
+    } elseif (isset($_GET['token'])) {
+        $token = (string) $_GET['token'];
+    } elseif (isset($_POST['token'])) {
+        $token = (string) $_POST['token'];
+    }
+    if ($token === '' || strpos($token, '.') === false) {
+        return false;
+    }
+    [$expStr, $sig] = explode('.', $token, 2);
+    if (!ctype_digit($expStr) || (int) $expStr < time()) {
+        return false;
+    }
+    $expected = hash_hmac('sha256', $expStr, $secret);
+    return hash_equals($expected, $sig);
+}
+
+function loadCaptions(string $baseDir): array {
+    $file = $baseDir . DIRECTORY_SEPARATOR . 'photos' . DIRECTORY_SEPARATOR . 'captions.json';
+    if (!is_file($file) || !is_readable($file)) {
+        return [];
+    }
+    $decoded = json_decode((string) @file_get_contents($file), true);
+    if (!is_array($decoded)) {
+        return [];
+    }
+    $out = [];
+    foreach ($decoded as $k => $v) {
+        if (is_string($k) && is_string($v)) {
+            $out[$k] = $v;
+        }
+    }
+    return $out;
+}
+
+function saveCaptions(string $baseDir, array $captions): bool {
+    $photosDir = $baseDir . DIRECTORY_SEPARATOR . 'photos';
+    if (!is_dir($photosDir) && !@mkdir($photosDir, 0755, true) && !is_dir($photosDir)) {
+        return false;
+    }
+    $file = $photosDir . DIRECTORY_SEPARATOR . 'captions.json';
+    $json = json_encode($captions, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    return $json !== false && @file_put_contents($file, $json, LOCK_EX) !== false;
+}
+
+function resolveSafeImageRel(string $rel, string $baseDir): ?array {
+    $allowedExt = ['jpg', 'jpeg', 'png', 'webp', 'gif', 'avif'];
+    $cleanRel = str_replace('\\', '/', ltrim($rel, '/\\'));
+    if ($cleanRel === '' || strpos($cleanRel, '..') !== false || strpos($cleanRel, "\0") !== false) {
+        return null;
+    }
+    $realBase = realpath($baseDir);
+    $full = $realBase !== false ? realpath($realBase . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $cleanRel)) : false;
+    if ($realBase === false || $full === false || strpos($full, $realBase . DIRECTORY_SEPARATOR) !== 0 || !is_file($full)) {
+        return null;
+    }
+    $ext = strtolower(pathinfo($full, PATHINFO_EXTENSION));
+    if (!in_array($ext, $allowedExt, true)) {
+        return null;
+    }
+    $normRel = str_replace('\\', '/', substr($full, strlen($realBase) + 1));
+    return ['rel' => $normRel, 'full' => $full, 'ext' => $ext];
+}
+
+function scanPictures(string $baseDir): array {
+    $allowedExt = ['jpg', 'jpeg', 'png', 'webp', 'gif', 'avif'];
+    $captions = loadCaptions($baseDir);
+    $roots = [
+        ['dir' => $baseDir, 'prefix' => ''],
+        ['dir' => $baseDir . DIRECTORY_SEPARATOR . 'photos', 'prefix' => 'photos/'],
+    ];
+    $items = [];
+    foreach ($roots as $root) {
+        if (!is_dir($root['dir'])) {
+            continue;
+        }
+        $entries = @scandir($root['dir']);
+        if (!is_array($entries)) {
+            continue;
+        }
+        foreach ($entries as $name) {
+            if ($name === '.' || $name === '..') {
+                continue;
+            }
+            $full = $root['dir'] . DIRECTORY_SEPARATOR . $name;
+            if (!is_file($full)) {
+                continue;
+            }
+            $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
+            if (!in_array($ext, $allowedExt, true)) {
+                continue;
+            }
+            $rel = $root['prefix'] . $name;
+            $items[] = [
+                'file'    => $rel,
+                'name'    => $name,
+                'caption' => $captions[$rel] ?? '',
+                'mtime'   => (int) @filemtime($full),
+            ];
+        }
+    }
+    usort($items, static function (array $a, array $b): int {
+        return $b['mtime'] <=> $a['mtime'] ?: strcmp($a['name'], $b['name']);
+    });
+    return $items;
+}
+
+function sendJson(int $status, array $payload): void {
+    http_response_code($status);
+    header('Content-Type: application/json; charset=UTF-8');
+    header('Cache-Control: no-store');
+    echo json_encode($payload, JSON_UNESCAPED_SLASHES);
+    exit;
+}
+
+$action = isset($_GET['action']) ? (string) $_GET['action'] : '';
+if ($action !== '') {
+    $secret = getVaultSecret();
+
+    if ($action === 'unlock' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        $raw = (string) @file_get_contents('php://input');
+        $body = json_decode($raw, true);
+        $pw = is_array($body) && isset($body['password'])
+            ? (string) $body['password']
+            : (isset($_POST['password']) ? (string) $_POST['password'] : '');
+
+        if (!hash_equals('0705', $pw)) {
+            sendJson(403, ['ok' => false, 'error' => 'Incorrect password']);
+        }
+        $token = makeVaultToken($secret);
+        sendJson(200, [
+            'ok'     => true,
+            'token'  => $token,
+            'images' => scanPictures(__DIR__),
+        ]);
+    }
+
+    if ($action === 'list') {
+        if (!verifyVaultToken($secret)) {
+            sendJson(403, ['ok' => false, 'error' => 'Locked']);
+        }
+        sendJson(200, ['ok' => true, 'images' => scanPictures(__DIR__)]);
+    }
+
+    if ($action === 'upload' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        if (!verifyVaultToken($secret)) {
+            sendJson(403, ['ok' => false, 'error' => 'Locked']);
+        }
+        if (empty($_FILES['photos'])) {
+            sendJson(400, ['ok' => false, 'error' => 'No image files received']);
+        }
+        $photosDir = __DIR__ . DIRECTORY_SEPARATOR . 'photos';
+        if (!is_dir($photosDir) && !@mkdir($photosDir, 0755, true) && !is_dir($photosDir)) {
+            sendJson(500, ['ok' => false, 'error' => 'Unable to create photos folder']);
+        }
+
+        $allowedExt = ['jpg', 'jpeg', 'png', 'webp', 'gif', 'avif'];
+        $f = $_FILES['photos'];
+        $names = is_array($f['name']) ? $f['name'] : [$f['name']];
+        $tmps = is_array($f['tmp_name']) ? $f['tmp_name'] : [$f['tmp_name']];
+        $errs = is_array($f['error']) ? $f['error'] : [$f['error']];
+        $sizes = is_array($f['size']) ? $f['size'] : [$f['size']];
+
+        $added = 0;
+        $finfo = function_exists('finfo_open') ? @finfo_open(FILEINFO_MIME_TYPE) : false;
+
+        foreach ($names as $idx => $origName) {
+            if (($errs[$idx] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
+                continue;
+            }
+            $tmp = (string) ($tmps[$idx] ?? '');
+            $size = (int) ($sizes[$idx] ?? 0);
+            if ($tmp === '' || !is_uploaded_file($tmp) || $size <= 0 || $size > 15 * 1024 * 1024) {
+                continue;
+            }
+            $ext = strtolower(pathinfo((string) $origName, PATHINFO_EXTENSION));
+            if (!in_array($ext, $allowedExt, true)) {
+                continue;
+            }
+            $isImage = @getimagesize($tmp) !== false;
+            if (!$isImage && $finfo) {
+                $mime = (string) @finfo_file($finfo, $tmp);
+                $isImage = strpos($mime, 'image/') === 0;
+            }
+            if (!$isImage) {
+                continue;
+            }
+
+            $baseName = pathinfo((string) $origName, PATHINFO_FILENAME);
+            $safeBase = preg_replace('/[^a-zA-Z0-9._-]+/', '_', $baseName) ?: 'photo';
+            $safeBase = trim($safeBase, '._-') ?: 'photo';
+            $safeBase = substr($safeBase, 0, 48);
+            $destName = date('Ymd_His') . '_' . bin2hex(random_bytes(3)) . '_' . $safeBase . '.' . $ext;
+            if (@move_uploaded_file($tmp, $photosDir . DIRECTORY_SEPARATOR . $destName)) {
+                $added++;
+            }
+        }
+        if ($finfo) {
+            @finfo_close($finfo);
+        }
+
+        sendJson(200, [
+            'ok'     => true,
+            'added'  => $added,
+            'images' => scanPictures(__DIR__),
+        ]);
+    }
+
+    if ($action === 'caption' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        if (!verifyVaultToken($secret)) {
+            sendJson(403, ['ok' => false, 'error' => 'Locked']);
+        }
+        $raw = (string) @file_get_contents('php://input');
+        $body = json_decode($raw, true);
+        if (!is_array($body)) {
+            sendJson(400, ['ok' => false, 'error' => 'Invalid payload']);
+        }
+        $resolved = resolveSafeImageRel((string) ($body['file'] ?? ''), __DIR__);
+        if ($resolved === null) {
+            sendJson(404, ['ok' => false, 'error' => 'Picture not found']);
+        }
+        $cap = trim((string) preg_replace('/[\x00-\x1F\x7F]+/u', ' ', (string) ($body['caption'] ?? '')));
+        if (function_exists('mb_substr')) {
+            $cap = mb_substr($cap, 0, 240, 'UTF-8');
+        } else {
+            $cap = substr($cap, 0, 240);
+        }
+        $captions = loadCaptions(__DIR__);
+        if ($cap === '') {
+            unset($captions[$resolved['rel']]);
+        } else {
+            $captions[$resolved['rel']] = $cap;
+        }
+        if (!saveCaptions(__DIR__, $captions)) {
+            sendJson(500, ['ok' => false, 'error' => 'Unable to save caption']);
+        }
+        sendJson(200, [
+            'ok'      => true,
+            'file'    => $resolved['rel'],
+            'caption' => $cap,
+            'images'  => scanPictures(__DIR__),
+        ]);
+    }
+
+    if ($action === 'image') {
+        if (!verifyVaultToken($secret)) {
+            http_response_code(403);
+            exit('Forbidden');
+        }
+        $resolved = resolveSafeImageRel(isset($_GET['file']) ? (string) $_GET['file'] : '', __DIR__);
+        if ($resolved === null) {
+            http_response_code(404);
+            exit('Not found');
+        }
+        $mimeMap = [
+            'jpg'  => 'image/jpeg',
+            'jpeg' => 'image/jpeg',
+            'png'  => 'image/png',
+            'webp' => 'image/webp',
+            'gif'  => 'image/gif',
+            'avif' => 'image/avif',
+        ];
+        if (!isset($mimeMap[$resolved['ext']])) {
+            http_response_code(403);
+            exit('Forbidden');
+        }
+        header('Content-Type: ' . $mimeMap[$resolved['ext']]);
+        header('Content-Length: ' . (string) filesize($resolved['full']));
+        header('Cache-Control: private, max-age=3600');
+        readfile($resolved['full']);
+        exit;
+    }
+
+    sendJson(400, ['ok' => false, 'error' => 'Unknown action']);
+}
+
+header('Content-Type: text/html; charset=UTF-8');
+
+$allowedSpecies = ['sundrop', 'lily', 'lotus', 'rose'];
+$allowedPalettes = ['sundrop', 'pink', 'cyan', 'rose', 'solar', 'emerald'];
+
+$species = isset($_GET['species']) && in_array($_GET['species'], $allowedSpecies, true)
+    ? $_GET['species']
+    : 'sundrop';
+
+$palette = isset($_GET['palette']) && in_array($_GET['palette'], $allowedPalettes, true)
+    ? $_GET['palette']
+    : 'sundrop';
+
+$bloom = 0.92;
+if (isset($_GET['bloom']) && is_numeric($_GET['bloom'])) {
+    $bloom = max(0.0, min(1.25, (float) $_GET['bloom']));
+}
+
+$initialConfig = [
+    'species' => $species,
+    'palette' => $palette,
+    'bloom'   => $bloom,
+];
+$configJson = json_encode($initialConfig, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Sundrop Lily — Rapunzel 3D Hologram Flower</title>
+<style>
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  input, textarea {
+    user-select: text;
+  }
+
+  html, body {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #010308;
+  }
+
+  body {
+    background:
+      radial-gradient(circle at 50% 42%, rgba(16, 48, 78, 0.42) 0%, rgba(5, 13, 28, 0.86) 52%, #010206 100%);
+  }
+
+  #stage {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+    cursor: grab;
+    touch-action: none;
+  }
+
+  #stage:active {
+    cursor: grabbing;
+  }
+
+  .holo-vignette {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background: radial-gradient(circle at 50% 50%, transparent 48%, rgba(0, 2, 8, 0.68) 100%);
+  }
+
+  /* Vault & Pictures Modal */
+  .vault-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    background: rgba(2, 4, 10, 0.72);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.25s ease;
+    font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    color: #fff8e6;
+  }
+
+  .vault-backdrop.open {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .vault-card {
+    position: relative;
+    width: min(400px, 100%);
+    background: rgba(16, 12, 6, 0.86);
+    border: 1px solid rgba(255, 214, 71, 0.32);
+    border-radius: 22px;
+    padding: 28px 24px 24px;
+    box-shadow: 0 24px 70px rgba(0, 0, 0, 0.75), 0 0 40px rgba(255, 198, 54, 0.14);
+    transform: translateY(10px) scale(0.97);
+    transition: transform 0.25s ease, width 0.25s ease;
+  }
+
+  .vault-backdrop.open .vault-card {
+    transform: translateY(0) scale(1);
+  }
+
+  .vault-card.is-gallery {
+    width: min(860px, 100%);
+    max-height: min(86dvh, 720px);
+    display: flex;
+    flex-direction: column;
+    padding: 22px;
+  }
+
+  .vault-close {
+    position: absolute;
+    top: 14px;
+    right: 14px;
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    border: 1px solid rgba(255, 214, 71, 0.25);
+    background: rgba(255, 214, 71, 0.08);
+    color: #ffe8a3;
+    font-size: 16px;
+    cursor: pointer;
+    display: grid;
+    place-items: center;
+    transition: background 0.18s ease, border-color 0.18s ease;
+  }
+
+  .vault-close:hover {
+    background: rgba(255, 214, 71, 0.2);
+    border-color: #ffd647;
+  }
+
+  .vault-lock-head {
+    text-align: center;
+    margin-bottom: 18px;
+  }
+
+  .vault-crest {
+    width: 46px;
+    height: 46px;
+    margin: 0 auto 10px;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    font-size: 20px;
+    color: #ffd647;
+    background: radial-gradient(circle, rgba(255, 214, 71, 0.28), rgba(255, 165, 28, 0.06));
+    border: 1px solid rgba(255, 214, 71, 0.4);
+    box-shadow: 0 0 24px rgba(255, 214, 71, 0.24);
+  }
+
+  .vault-title {
+    font-size: 17px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    color: #fff6d6;
+  }
+
+  .vault-sub {
+    margin-top: 4px;
+    font-size: 12.5px;
+    color: rgba(255, 232, 175, 0.68);
+  }
+
+  .pin-dots {
+    display: flex;
+    justify-content: center;
+    gap: 12px;
+    margin: 18px 0 8px;
+  }
+
+  .pin-dots.shake {
+    animation: pinShake 0.36s ease;
+  }
+
+  @keyframes pinShake {
+    0%, 100% { transform: translateX(0); }
+    20% { transform: translateX(-8px); }
+    40% { transform: translateX(8px); }
+    60% { transform: translateX(-6px); }
+    80% { transform: translateX(6px); }
+  }
+
+  .pin-box {
+    width: 48px;
+    height: 54px;
+    border-radius: 13px;
+    border: 1px solid rgba(255, 214, 71, 0.28);
+    background: rgba(255, 255, 255, 0.04);
+    display: grid;
+    place-items: center;
+    font-size: 24px;
+    color: #ffd647;
+    transition: border-color 0.16s ease, box-shadow 0.16s ease, background 0.16s ease;
+  }
+
+  .pin-box.filled {
+    border-color: #ffd647;
+    background: rgba(255, 214, 71, 0.12);
+    box-shadow: 0 0 16px rgba(255, 214, 71, 0.22);
+  }
+
+  .pin-error {
+    min-height: 18px;
+    text-align: center;
+    font-size: 12px;
+    color: #ff859d;
+    margin-bottom: 12px;
+  }
+
+  .keypad {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 9px;
+  }
+
+  .key-btn {
+    appearance: none;
+    height: 46px;
+    border-radius: 12px;
+    border: 1px solid rgba(255, 214, 71, 0.2);
+    background: rgba(255, 214, 71, 0.06);
+    color: #fff6da;
+    font-size: 16px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.14s ease, border-color 0.14s ease, transform 0.1s ease;
+  }
+
+  .key-btn:hover {
+    background: rgba(255, 214, 71, 0.16);
+    border-color: rgba(255, 214, 71, 0.55);
+  }
+
+  .key-btn:active {
+    transform: scale(0.96);
+  }
+
+  .key-btn.key-muted {
+    font-size: 13px;
+    color: rgba(255, 232, 175, 0.72);
+  }
+
+  /* Gallery Header & Grid */
+  .gallery-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding-right: 40px;
+    margin-bottom: 14px;
+    flex-wrap: wrap;
+  }
+
+  .gallery-title-wrap {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .gallery-count {
+    font-size: 12px;
+    padding: 3px 9px;
+    border-radius: 999px;
+    background: rgba(255, 214, 71, 0.14);
+    border: 1px solid rgba(255, 214, 71, 0.28);
+    color: #ffe285;
+  }
+
+  .gallery-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .v-btn {
+    appearance: none;
+    border: 1px solid rgba(255, 214, 71, 0.34);
+    background: rgba(255, 214, 71, 0.14);
+    color: #fff6da;
+    font-size: 12.5px;
+    font-weight: 500;
+    padding: 7px 13px;
+    border-radius: 10px;
+    cursor: pointer;
+    transition: background 0.18s ease, border-color 0.18s ease;
+  }
+
+  .v-btn:hover {
+    background: rgba(255, 214, 71, 0.26);
+    border-color: #ffd647;
+  }
+
+  .v-btn.ghost {
+    background: rgba(255, 255, 255, 0.05);
+    border-color: rgba(255, 255, 255, 0.16);
+    color: rgba(255, 240, 200, 0.8);
+  }
+
+  .gallery-body {
+    flex: 1;
+    overflow-y: auto;
+    min-height: 220px;
+    padding-right: 2px;
+  }
+
+  .gallery-body.drag-over {
+    outline: 2px dashed #ffd647;
+    outline-offset: -4px;
+    border-radius: 14px;
+  }
+
+  .gallery-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: 12px;
+  }
+
+  .photo-tile {
+    display: flex;
+    flex-direction: column;
+    border-radius: 14px;
+    overflow: hidden;
+    border: 1px solid rgba(255, 214, 71, 0.24);
+    background: rgba(24, 18, 8, 0.72);
+    cursor: pointer;
+    transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+  }
+
+  .photo-tile:hover {
+    transform: translateY(-2px);
+    border-color: #ffd647;
+    box-shadow: 0 8px 24px rgba(255, 206, 68, 0.24);
+  }
+
+  .photo-thumb {
+    width: 100%;
+    aspect-ratio: 1 / 1;
+    overflow: hidden;
+    background: rgba(255, 255, 255, 0.04);
+  }
+
+  .photo-thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+
+  .photo-cap-bar {
+    padding: 8px 10px;
+    border-top: 1px solid rgba(255, 214, 71, 0.16);
+    background: rgba(14, 10, 4, 0.92);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    min-height: 42px;
+  }
+
+  .photo-cap-text {
+    font-size: 12px;
+    line-height: 1.3;
+    color: #fff6dc;
+    text-shadow: 0 1px 4px rgba(0, 0, 0, 0.8);
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    word-break: break-word;
+  }
+
+  .photo-cap-text.is-placeholder {
+    color: rgba(255, 232, 175, 0.72);
+    font-style: italic;
+  }
+
+  .photo-cap-edit {
+    flex: 0 0 auto;
+    appearance: none;
+    width: 26px;
+    height: 26px;
+    border-radius: 8px;
+    border: 1px solid rgba(255, 214, 71, 0.34);
+    background: rgba(16, 12, 6, 0.76);
+    color: #ffe285;
+    font-size: 12px;
+    cursor: pointer;
+    display: grid;
+    place-items: center;
+    opacity: 0.86;
+    transition: opacity 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+  }
+
+  .photo-cap-edit:hover {
+    opacity: 1;
+    background: rgba(255, 214, 71, 0.24);
+    border-color: #ffd647;
+  }
+
+  .gallery-empty {
+    border: 1px dashed rgba(255, 214, 71, 0.34);
+    border-radius: 16px;
+    padding: 40px 20px;
+    text-align: center;
+    background: rgba(255, 214, 71, 0.04);
+  }
+
+  .gallery-empty p {
+    font-size: 13.5px;
+    line-height: 1.55;
+    color: rgba(255, 236, 186, 0.8);
+    margin-bottom: 14px;
+  }
+
+  .gallery-status {
+    margin-top: 10px;
+    font-size: 12px;
+    color: rgba(255, 224, 130, 0.85);
+    min-height: 16px;
+  }
+
+  /* Full-size Lightbox */
+  .lightbox {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    background: rgba(2, 3, 8, 0.92);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 28px;
+  }
+
+  .lightbox.open {
+    display: flex;
+  }
+
+  .lightbox img {
+    max-width: min(92vw, 1100px);
+    max-height: 82dvh;
+    border-radius: 14px;
+    border: 1px solid rgba(255, 214, 71, 0.32);
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.85);
+    object-fit: contain;
+  }
+
+  .lb-nav {
+    position: fixed;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    border: 1px solid rgba(255, 214, 71, 0.35);
+    background: rgba(16, 12, 6, 0.72);
+    color: #ffe8a3;
+    font-size: 22px;
+    cursor: pointer;
+    display: grid;
+    place-items: center;
+  }
+
+  .lb-nav.prev { left: 18px; }
+  .lb-nav.next { right: 18px; }
+
+  .lb-caption-bar {
+    position: fixed;
+    bottom: 18px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: min(640px, calc(100vw - 32px));
+    background: rgba(16, 12, 6, 0.84);
+    padding: 8px 14px;
+    border-radius: 14px;
+    border: 1px solid rgba(255, 214, 71, 0.28);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+
+  .lb-caption-read {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    width: 100%;
+  }
+
+  .lb-caption-text {
+    font-size: 13px;
+    color: #fff6da;
+    line-height: 1.35;
+    word-break: break-word;
+  }
+
+  .lb-caption-meta {
+    flex: 0 0 auto;
+    font-size: 11.5px;
+    color: rgba(255, 224, 140, 0.72);
+  }
+
+  .lb-caption-form {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+  }
+
+  .lb-caption-input {
+    flex: 1;
+    min-width: 0;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 214, 71, 0.36);
+    border-radius: 9px;
+    padding: 6px 10px;
+    color: #fff8e6;
+    font-size: 13px;
+    outline: none;
+  }
+
+  .lb-caption-input:focus {
+    border-color: #ffd647;
+    box-shadow: 0 0 12px rgba(255, 214, 71, 0.25);
+  }
+
+  .hidden {
+    display: none !important;
+  }
+</style>
+</head>
+<body>
+  <canvas id="stage" aria-label="Interactive 3D Hologram Flower"></canvas>
+  <div class="holo-vignette"></div>
+
+  <div id="vault-backdrop" class="vault-backdrop" role="dialog" aria-modal="true" aria-labelledby="vault-heading">
+    <div id="vault-card" class="vault-card">
+      <button id="vault-close" class="vault-close" aria-label="Close">✕</button>
+
+      <div id="vault-lock-view">
+        <div class="vault-lock-head">
+          <div class="vault-crest">✦</div>
+          <div id="vault-heading" class="vault-title">Enter Password</div>
+          <div class="vault-sub">Unlock the Sundrop picture gallery</div>
+        </div>
+        <div id="pin-dots" class="pin-dots" aria-live="polite">
+          <div class="pin-box"></div>
+          <div class="pin-box"></div>
+          <div class="pin-box"></div>
+          <div class="pin-box"></div>
+        </div>
+        <div id="pin-error" class="pin-error"></div>
+        <div id="keypad" class="keypad">
+          <button type="button" class="key-btn" data-key="1">1</button>
+          <button type="button" class="key-btn" data-key="2">2</button>
+          <button type="button" class="key-btn" data-key="3">3</button>
+          <button type="button" class="key-btn" data-key="4">4</button>
+          <button type="button" class="key-btn" data-key="5">5</button>
+          <button type="button" class="key-btn" data-key="6">6</button>
+          <button type="button" class="key-btn" data-key="7">7</button>
+          <button type="button" class="key-btn" data-key="8">8</button>
+          <button type="button" class="key-btn" data-key="9">9</button>
+          <button type="button" class="key-btn key-muted" data-key="clear">Clear</button>
+          <button type="button" class="key-btn" data-key="0">0</button>
+          <button type="button" class="key-btn key-muted" data-key="back">⌫</button>
+        </div>
+      </div>
+
+      <div id="vault-gallery-view" class="hidden">
+        <div class="gallery-head">
+          <div class="gallery-title-wrap">
+            <div class="vault-title">Pictures</div>
+            <span id="gallery-count" class="gallery-count">0 photos</span>
+          </div>
+          <div class="gallery-actions">
+            <input id="photo-input" type="file" accept="image/*" multiple class="hidden">
+            <button id="btn-add-photos" type="button" class="v-btn">+ Add Pictures</button>
+            <button id="btn-lock-vault" type="button" class="v-btn ghost">Lock</button>
+          </div>
+        </div>
+        <div id="gallery-body" class="gallery-body">
+          <div id="gallery-grid" class="gallery-grid"></div>
+          <div id="gallery-empty" class="gallery-empty hidden">
+            <p>No pictures yet. Click <strong>+ Add Pictures</strong> or drop image files here (or place images inside <code>c:\personal website\pictures</code>).</p>
+            <button id="btn-empty-add" type="button" class="v-btn">+ Add Pictures</button>
+          </div>
+        </div>
+        <div id="gallery-status" class="gallery-status"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="vault-lightbox" class="lightbox" aria-hidden="true">
+    <button id="lb-close" class="vault-close" aria-label="Close viewer">✕</button>
+    <button id="lb-prev" class="lb-nav prev" aria-label="Previous photo">‹</button>
+    <img id="lb-img" alt="">
+    <button id="lb-next" class="lb-nav next" aria-label="Next photo">›</button>
+    <div id="lb-caption-bar" class="lb-caption-bar">
+      <div id="lb-caption-read" class="lb-caption-read">
+        <span id="lb-caption" class="lb-caption-text"></span>
+        <div style="display:flex;align-items:center;gap:8px;flex:0 0 auto;">
+          <span id="lb-counter" class="lb-caption-meta"></span>
+          <button id="lb-edit-cap" type="button" class="v-btn" style="padding:5px 10px;font-size:12px;">Edit Caption</button>
+        </div>
+      </div>
+      <form id="lb-caption-form" class="lb-caption-form hidden">
+        <input id="lb-caption-input" class="lb-caption-input" type="text" maxlength="240" placeholder="Write a caption for this picture...">
+        <button id="lb-save-cap" type="submit" class="v-btn" style="padding:6px 11px;font-size:12px;">Save</button>
+        <button id="lb-cancel-cap" type="button" class="v-btn ghost" style="padding:6px 10px;font-size:12px;">Cancel</button>
+      </form>
+    </div>
+  </div>
+
+<script>
+(() => {
+  'use strict';
+
+  const INIT = <?php echo $configJson; ?>;
+
+  const PALETTES = {
+    sundrop: {
+      accent: '#ffd647',
+      inner: [1.0, 0.54, 0.06],
+      outer: [1.0, 0.88, 0.24],
+      rim: [1.0, 0.97, 0.72],
+      core: [1.0, 0.98, 0.80],
+      stem: [0.18, 0.86, 0.52]
+    },
+    pink: {
+      accent: '#ff66cc',
+      inner: [1.0, 0.14, 0.56],
+      outer: [1.0, 0.58, 0.86],
+      rim: [0.96, 0.82, 1.0],
+      core: [1.0, 0.84, 0.52],
+      stem: [0.22, 0.88, 0.78]
+    },
+    cyan: {
+      accent: '#38f2ff',
+      inner: [0.18, 0.56, 1.0],
+      outer: [0.22, 0.96, 1.0],
+      rim: [0.68, 0.42, 1.0],
+      core: [0.85, 0.99, 1.0],
+      stem: [0.12, 0.84, 0.95]
+    },
+    rose: {
+      accent: '#ff52c4',
+      inner: [1.0, 0.24, 0.64],
+      outer: [1.0, 0.52, 0.88],
+      rim: [0.50, 0.42, 1.0],
+      core: [1.0, 0.90, 0.65],
+      stem: [0.55, 0.42, 1.0]
+    },
+    solar: {
+      accent: '#ffd25a',
+      inner: [1.0, 0.54, 0.16],
+      outer: [1.0, 0.86, 0.36],
+      rim: [0.20, 0.95, 0.86],
+      core: [1.0, 0.98, 0.82],
+      stem: [0.18, 0.92, 0.78]
+    },
+    emerald: {
+      accent: '#30ffa4',
+      inner: [0.10, 0.88, 0.55],
+      outer: [0.24, 1.0, 0.72],
+      rim: [0.24, 0.84, 1.0],
+      core: [0.85, 1.0, 0.92],
+      stem: [0.15, 0.92, 0.82]
+    }
+  };
+
+  const state = {
+    species: INIT.species in { sundrop: 1, lily: 1, lotus: 1, rose: 1 } ? INIT.species : 'sundrop',
+    palette: INIT.palette in PALETTES ? INIT.palette : 'sundrop',
+    baseBloom: typeof INIT.bloom === 'number' ? INIT.bloom : 0.92,
+    breathe: true,
+    scanline: 0.48,
+    glitch: 0.22,
+    autoOrbit: true,
+    yaw: 0.35,
+    pitch: 0.34,
+    distance: 4.55,
+    velYaw: 0,
+    velPitch: 0,
+    pulseStrength: 0,
+    pulseTime: 0,
+    time: 0
+  };
+
+  const canvas = document.getElementById('stage');
+  const gl = canvas.getContext('webgl', {
+    alpha: false,
+    antialias: true,
+    powerPreference: 'high-performance'
+  }) || canvas.getContext('experimental-webgl', { alpha: false, antialias: true });
+
+  /* =========================================================================
+   * Minimal 4x4 Matrix & Vector Math
+   * ========================================================================= */
+  function mat4Identity() {
+    return new Float32Array([
+      1, 0, 0, 0,
+      0, 1, 0, 0,
+      0, 0, 1, 0,
+      0, 0, 0, 1
+    ]);
+  }
+
+  function mat4Multiply(a, b) {
+    const out = new Float32Array(16);
+    for (let col = 0; col < 4; col++) {
+      const b0 = b[col * 4], b1 = b[col * 4 + 1], b2 = b[col * 4 + 2], b3 = b[col * 4 + 3];
+      out[col * 4]     = a[0] * b0 + a[4] * b1 + a[8]  * b2 + a[12] * b3;
+      out[col * 4 + 1] = a[1] * b0 + a[5] * b1 + a[9]  * b2 + a[13] * b3;
+      out[col * 4 + 2] = a[2] * b0 + a[6] * b1 + a[10] * b2 + a[14] * b3;
+      out[col * 4 + 3] = a[3] * b0 + a[7] * b1 + a[11] * b2 + a[15] * b3;
+    }
+    return out;
+  }
+
+  function mat4Perspective(fovRad, aspect, near, far) {
+    const f = 1.0 / Math.tan(fovRad * 0.5);
+    const nf = 1.0 / (near - far);
+    const out = new Float32Array(16);
+    out[0] = f / aspect;
+    out[5] = f;
+    out[10] = (far + near) * nf;
+    out[11] = -1;
+    out[14] = 2 * far * near * nf;
+    return out;
+  }
+
+  function mat4LookAt(eye, target, up) {
+    let zx = eye[0] - target[0];
+    let zy = eye[1] - target[1];
+    let zz = eye[2] - target[2];
+    let len = Math.hypot(zx, zy, zz) || 1;
+    zx /= len; zy /= len; zz /= len;
+
+    let xx = up[1] * zz - up[2] * zy;
+    let xy = up[2] * zx - up[0] * zz;
+    let xz = up[0] * zy - up[1] * zx;
+    len = Math.hypot(xx, xy, xz) || 1;
+    xx /= len; xy /= len; xz /= len;
+
+    const yx = zy * xz - zz * xy;
+    const yy = zz * xx - zx * xz;
+    const yz = zx * xy - zy * xx;
+
+    const out = new Float32Array(16);
+    out[0] = xx; out[4] = xy; out[8]  = xz; out[12] = -(xx * eye[0] + xy * eye[1] + xz * eye[2]);
+    out[1] = yx; out[5] = yy; out[9]  = yz; out[13] = -(yx * eye[0] + yy * eye[1] + yz * eye[2]);
+    out[2] = zx; out[6] = zy; out[10] = zz; out[14] = -(zx * eye[0] + zy * eye[1] + zz * eye[2]);
+    out[15] = 1;
+    return out;
+  }
+
+  function mat4RotateZ(rad) {
+    const c = Math.cos(rad);
+    const s = Math.sin(rad);
+    const out = mat4Identity();
+    out[0] = c;  out[4] = -s;
+    out[1] = s;  out[5] = c;
+    return out;
+  }
+
+  function normalize3(x, y, z) {
+    const l = Math.hypot(x, y, z) || 1;
+    return [x / l, y / l, z / l];
+  }
+
+  function cross3(ax, ay, az, bx, by, bz) {
+    return [
+      ay * bz - az * by,
+      az * bx - ax * bz,
+      ax * by - ay * bx
+    ];
+  }
+
+  function triggerPulse() {
+    state.pulseStrength = 1.0;
+    state.pulseTime = 0.0;
+  }
+
+  /* =========================================================================
+   * Flower Click Hitbox, Passcode Gate & Picture Gallery
+   * ========================================================================= */
+  let flowerHitRect = null;
+  let modalOpenTimer = null;
+  const vault = {
+    open: false,
+    token: null,
+    pin: '',
+    checking: false,
+    images: [],
+    lightboxIndex: -1
+  };
+
+  const vaultBackdrop = document.getElementById('vault-backdrop');
+  const vaultCard = document.getElementById('vault-card');
+  const vaultClose = document.getElementById('vault-close');
+  const lockView = document.getElementById('vault-lock-view');
+  const galleryView = document.getElementById('vault-gallery-view');
+  const pinDots = document.getElementById('pin-dots');
+  const pinBoxes = pinDots.querySelectorAll('.pin-box');
+  const pinError = document.getElementById('pin-error');
+  const galleryCount = document.getElementById('gallery-count');
+  const galleryBody = document.getElementById('gallery-body');
+  const galleryGrid = document.getElementById('gallery-grid');
+  const galleryEmpty = document.getElementById('gallery-empty');
+  const galleryStatus = document.getElementById('gallery-status');
+  const photoInput = document.getElementById('photo-input');
+  const btnAddPhotos = document.getElementById('btn-add-photos');
+  const btnEmptyAdd = document.getElementById('btn-empty-add');
+  const btnLockVault = document.getElementById('btn-lock-vault');
+  const lightbox = document.getElementById('vault-lightbox');
+  const lbImg = document.getElementById('lb-img');
+  const lbCaption = document.getElementById('lb-caption');
+  const lbCounter = document.getElementById('lb-counter');
+  const lbCaptionRead = document.getElementById('lb-caption-read');
+  const lbCaptionForm = document.getElementById('lb-caption-form');
+  const lbCaptionInput = document.getElementById('lb-caption-input');
+  const lbEditCap = document.getElementById('lb-edit-cap');
+  const lbCancelCap = document.getElementById('lb-cancel-cap');
+  const lbClose = document.getElementById('lb-close');
+  const lbPrev = document.getElementById('lb-prev');
+  const lbNext = document.getElementById('lb-next');
+
+  function formatFallbackCaption(filename) {
+    const noExt = String(filename || '').replace(/\.[^.]+$/, '');
+    const noStamp = noExt.replace(/^\d{8}_\d{6}_[a-f0-9]{6}_/i, '');
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(_\d+)?$/i.test(noStamp)) {
+      return 'Add a caption...';
+    }
+    const cleaned = noStamp.replace(/[_-]+/g, ' ').trim();
+    return cleaned || 'Add a caption...';
+  }
+
+  function displayCaption(item) {
+    const custom = item && typeof item.caption === 'string' ? item.caption.trim() : '';
+    return custom || formatFallbackCaption(item ? item.name : '');
+  }
+
+  function isPointOnFlower(x, y) {
+    if (flowerHitRect) {
+      return x >= flowerHitRect.minX && x <= flowerHitRect.maxX &&
+             y >= flowerHitRect.minY && y <= flowerHitRect.maxY;
+    }
+    const cw = canvas.clientWidth || 1;
+    const ch = canvas.clientHeight || 1;
+    return Math.abs(x - cw * 0.5) < cw * 0.25 && Math.abs(y - ch * 0.5) < ch * 0.35;
+  }
+
+  function renderPinBoxes() {
+    pinBoxes.forEach((box, idx) => {
+      const filled = idx < vault.pin.length;
+      box.textContent = filled ? '•' : '';
+      box.classList.toggle('filled', filled);
+    });
+  }
+
+  function imageUrl(relFile) {
+    return '?action=image&file=' + encodeURIComponent(relFile) + '&token=' + encodeURIComponent(vault.token || '');
+  }
+
+  function renderGallery() {
+    const count = vault.images.length;
+    galleryCount.textContent = count === 1 ? '1 photo' : count + ' photos';
+    galleryGrid.innerHTML = '';
+    galleryEmpty.classList.toggle('hidden', count > 0);
+
+    vault.images.forEach((item, idx) => {
+      const cap = displayCaption(item);
+      const hasCustom = Boolean(item.caption && item.caption.trim());
+
+      const tile = document.createElement('div');
+      tile.className = 'photo-tile';
+      tile.setAttribute('role', 'button');
+      tile.tabIndex = 0;
+      tile.title = cap;
+
+      const thumb = document.createElement('div');
+      thumb.className = 'photo-thumb';
+
+      const img = document.createElement('img');
+      img.src = imageUrl(item.file);
+      img.alt = cap;
+      img.loading = 'lazy';
+      thumb.appendChild(img);
+
+      const bar = document.createElement('div');
+      bar.className = 'photo-cap-bar';
+
+      const capSpan = document.createElement('span');
+      capSpan.className = 'photo-cap-text' + (hasCustom ? '' : ' is-placeholder');
+      capSpan.textContent = cap;
+
+      const editBtn = document.createElement('button');
+      editBtn.type = 'button';
+      editBtn.className = 'photo-cap-edit';
+      editBtn.title = 'Edit caption';
+      editBtn.setAttribute('aria-label', 'Edit caption');
+      editBtn.textContent = '✎';
+      editBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        openLightbox(idx, true);
+      });
+
+      bar.appendChild(capSpan);
+      bar.appendChild(editBtn);
+      tile.appendChild(thumb);
+      tile.appendChild(bar);
+      tile.addEventListener('click', () => openLightbox(idx, false));
+      tile.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          openLightbox(idx, false);
+        }
+      });
+      galleryGrid.appendChild(tile);
+    });
+  }
+
+  function setCaptionEditing(editing) {
+    lbCaptionRead.classList.toggle('hidden', editing);
+    lbCaptionForm.classList.toggle('hidden', !editing);
+    if (editing) {
+      const item = vault.images[vault.lightboxIndex];
+      lbCaptionInput.value = item && item.caption ? item.caption : '';
+      lbCaptionInput.focus();
+      if (lbCaptionInput.select) lbCaptionInput.select();
+    }
+  }
+
+  function openLightbox(idx, startEditing) {
+    if (!vault.images.length) return;
+    const n = vault.images.length;
+    vault.lightboxIndex = ((idx % n) + n) % n;
+    const item = vault.images[vault.lightboxIndex];
+    const cap = displayCaption(item);
+    lbImg.src = imageUrl(item.file);
+    lbImg.alt = cap;
+    lbCaption.textContent = cap;
+    lbCounter.textContent = (vault.lightboxIndex + 1) + ' / ' + n;
+    lightbox.classList.add('open');
+    setCaptionEditing(Boolean(startEditing));
+  }
+
+  function closeLightbox() {
+    setCaptionEditing(false);
+    lightbox.classList.remove('open');
+    vault.lightboxIndex = -1;
+  }
+
+  async function saveCurrentCaption() {
+    if (!vault.token || vault.lightboxIndex < 0 || !vault.images[vault.lightboxIndex]) return;
+    const item = vault.images[vault.lightboxIndex];
+    const nextCap = lbCaptionInput.value.trim();
+    try {
+      const res = await fetch('?action=caption', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Vault-Token': vault.token
+        },
+        body: JSON.stringify({ file: item.file, caption: nextCap })
+      });
+      const data = await res.json();
+      if (res.ok && data.ok) {
+        if (Array.isArray(data.images)) {
+          vault.images = data.images;
+        } else {
+          item.caption = data.caption || '';
+        }
+        renderGallery();
+        const updated = vault.images[vault.lightboxIndex] || item;
+        lbCaption.textContent = displayCaption(updated);
+        setCaptionEditing(false);
+      }
+    } catch (err) {
+      galleryStatus.textContent = 'Could not save caption.';
+    }
+  }
+
+  function syncVaultView() {
+    const unlocked = Boolean(vault.token);
+    vaultCard.classList.toggle('is-gallery', unlocked);
+    lockView.classList.toggle('hidden', unlocked);
+    galleryView.classList.toggle('hidden', !unlocked);
+    if (unlocked) renderGallery();
+    else renderPinBoxes();
+  }
+
+  async function refreshGalleryList() {
+    if (!vault.token) return;
+    try {
+      const res = await fetch('?action=list', {
+        method: 'POST',
+        headers: { 'X-Vault-Token': vault.token }
+      });
+      if (res.status === 403) {
+        vault.token = null;
+        syncVaultView();
+        return;
+      }
+      const data = await res.json();
+      if (data.ok && Array.isArray(data.images)) {
+        vault.images = data.images;
+        renderGallery();
+      }
+    } catch (err) {
+      galleryStatus.textContent = 'Could not refresh pictures.';
+    }
+  }
+
+  function openVaultModal() {
+    vault.open = true;
+    pinError.textContent = '';
+    galleryStatus.textContent = '';
+    if (!vault.token) {
+      vault.pin = '';
+    } else {
+      refreshGalleryList();
+    }
+    syncVaultView();
+    vaultBackdrop.classList.add('open');
+  }
+
+  function closeVaultModal() {
+    vault.open = false;
+    closeLightbox();
+    vaultBackdrop.classList.remove('open');
+  }
+
+  async function submitPin() {
+    if (vault.checking || vault.pin.length < 4) return;
+    vault.checking = true;
+    pinError.textContent = '';
+    try {
+      const res = await fetch('?action=unlock', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: vault.pin })
+      });
+      const data = await res.json();
+      if (res.ok && data.ok) {
+        vault.token = data.token;
+        vault.images = Array.isArray(data.images) ? data.images : [];
+        vault.pin = '';
+        syncVaultView();
+      } else {
+        pinError.textContent = data.error || 'Incorrect password';
+        pinDots.classList.remove('shake');
+        void pinDots.offsetWidth;
+        pinDots.classList.add('shake');
+        vault.pin = '';
+        renderPinBoxes();
+      }
+    } catch (err) {
+      pinError.textContent = 'Unable to verify password';
+    } finally {
+      vault.checking = false;
+    }
+  }
+
+  function pushPinDigit(digit) {
+    if (vault.checking || vault.token) return;
+    if (digit === 'clear') {
+      vault.pin = '';
+      pinError.textContent = '';
+      renderPinBoxes();
+      return;
+    }
+    if (digit === 'back') {
+      vault.pin = vault.pin.slice(0, -1);
+      pinError.textContent = '';
+      renderPinBoxes();
+      return;
+    }
+    if (/^[0-9]$/.test(digit) && vault.pin.length < 4) {
+      vault.pin += digit;
+      pinError.textContent = '';
+      renderPinBoxes();
+      if (vault.pin.length === 4) {
+        submitPin();
+      }
+    }
+  }
+
+  async function uploadFiles(fileList) {
+    if (!vault.token || !fileList || !fileList.length) return;
+    const fd = new FormData();
+    let count = 0;
+    for (const file of fileList) {
+      if (file && file.type && file.type.startsWith('image/')) {
+        fd.append('photos[]', file);
+        count++;
+      } else if (file && /\.(jpg|jpeg|png|webp|gif|avif)$/i.test(file.name)) {
+        fd.append('photos[]', file);
+        count++;
+      }
+    }
+    if (!count) {
+      galleryStatus.textContent = 'Please select image files (JPG, PNG, WebP, GIF, AVIF).';
+      return;
+    }
+    galleryStatus.textContent = 'Uploading ' + count + (count === 1 ? ' picture...' : ' pictures...');
+    try {
+      const res = await fetch('?action=upload', {
+        method: 'POST',
+        headers: { 'X-Vault-Token': vault.token },
+        body: fd
+      });
+      const data = await res.json();
+      if (res.ok && data.ok) {
+        vault.images = Array.isArray(data.images) ? data.images : vault.images;
+        renderGallery();
+        galleryStatus.textContent = data.added > 0
+          ? 'Added ' + data.added + (data.added === 1 ? ' picture.' : ' pictures.')
+          : 'No valid images added.';
+      } else {
+        galleryStatus.textContent = data.error || 'Upload failed.';
+      }
+    } catch (err) {
+      galleryStatus.textContent = 'Upload failed.';
+    } finally {
+      photoInput.value = '';
+    }
+  }
+
+  document.getElementById('keypad').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-key]');
+    if (btn) pushPinDigit(btn.dataset.key);
+  });
+
+  vaultClose.addEventListener('click', closeVaultModal);
+  vaultBackdrop.addEventListener('click', (e) => {
+    if (e.target === vaultBackdrop) closeVaultModal();
+  });
+
+  btnAddPhotos.addEventListener('click', () => photoInput.click());
+  btnEmptyAdd.addEventListener('click', () => photoInput.click());
+  photoInput.addEventListener('change', () => uploadFiles(photoInput.files));
+
+  btnLockVault.addEventListener('click', () => {
+    vault.token = null;
+    vault.images = [];
+    vault.pin = '';
+    closeLightbox();
+    syncVaultView();
+  });
+
+  galleryBody.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    galleryBody.classList.add('drag-over');
+  });
+  galleryBody.addEventListener('dragleave', () => galleryBody.classList.remove('drag-over'));
+  galleryBody.addEventListener('drop', (e) => {
+    e.preventDefault();
+    galleryBody.classList.remove('drag-over');
+    if (e.dataTransfer && e.dataTransfer.files) {
+      uploadFiles(e.dataTransfer.files);
+    }
+  });
+
+  lbClose.addEventListener('click', closeLightbox);
+  lbPrev.addEventListener('click', () => openLightbox(vault.lightboxIndex - 1, false));
+  lbNext.addEventListener('click', () => openLightbox(vault.lightboxIndex + 1, false));
+  lbEditCap.addEventListener('click', () => setCaptionEditing(true));
+  lbCancelCap.addEventListener('click', () => setCaptionEditing(false));
+  lbCaptionForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    saveCurrentCaption();
+  });
+  lightbox.addEventListener('click', (e) => {
+    if (e.target === lightbox) closeLightbox();
+  });
+
+  window.addEventListener('keydown', (e) => {
+    const activeTag = document.activeElement && document.activeElement.tagName;
+    if (activeTag === 'INPUT' || activeTag === 'TEXTAREA') {
+      if (e.key === 'Escape' && lightbox.classList.contains('open')) {
+        setCaptionEditing(false);
+        if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+      }
+      return;
+    }
+    if (lightbox.classList.contains('open')) {
+      if (e.key === 'Escape') closeLightbox();
+      else if (e.key === 'ArrowLeft') openLightbox(vault.lightboxIndex - 1, false);
+      else if (e.key === 'ArrowRight') openLightbox(vault.lightboxIndex + 1, false);
+      return;
+    }
+    if (vault.open) {
+      if (e.key === 'Escape') {
+        closeVaultModal();
+      } else if (!vault.token) {
+        if (/^[0-9]$/.test(e.key)) pushPinDigit(e.key);
+        else if (e.key === 'Backspace') pushPinDigit('back');
+        else if (e.key === 'Enter' && vault.pin.length === 4) submitPin();
+      }
+      return;
+    }
+    if (e.code === 'Space') {
+      e.preventDefault();
+      triggerPulse();
+    }
+  });
+
+  /* =========================================================================
+   * Pointer Orbit, Pinch Zoom & Tap-to-Pulse
+   * ========================================================================= */
+  const pointers = new Map();
+  let dragStart = null;
+  let totalDragDist = 0;
+  let lastPinchDist = null;
+
+  canvas.addEventListener('pointerdown', (e) => {
+    canvas.setPointerCapture(e.pointerId);
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointers.size === 1) {
+      dragStart = { x: e.clientX, y: e.clientY };
+      totalDragDist = 0;
+      lastPinchDist = null;
+    } else if (pointers.size === 2) {
+      const pts = Array.from(pointers.values());
+      lastPinchDist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+    }
+  });
+
+  canvas.addEventListener('pointermove', (e) => {
+    if (!pointers.has(e.pointerId)) {
+      if (pointers.size === 0) {
+        canvas.style.cursor = isPointOnFlower(e.clientX, e.clientY) ? 'pointer' : 'grab';
+      }
+      return;
+    }
+    const prev = pointers.get(e.pointerId);
+    const dx = e.clientX - prev.x;
+    const dy = e.clientY - prev.y;
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    if (pointers.size === 1) {
+      totalDragDist += Math.hypot(dx, dy);
+      state.velYaw = -dx * 0.0065;
+      state.velPitch = dy * 0.0055;
+      state.yaw += state.velYaw;
+      state.pitch = Math.max(-0.55, Math.min(1.38, state.pitch + state.velPitch));
+    } else if (pointers.size === 2) {
+      const pts = Array.from(pointers.values());
+      const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+      if (lastPinchDist !== null) {
+        const delta = lastPinchDist - dist;
+        state.distance = Math.max(2.35, Math.min(8.4, state.distance + delta * 0.012));
+      }
+      lastPinchDist = dist;
+    }
+  });
+
+  function onPointerEnd(e) {
+    if (pointers.has(e.pointerId)) {
+      pointers.delete(e.pointerId);
+    }
+    if (pointers.size < 2) {
+      lastPinchDist = null;
+    }
+    if (pointers.size === 0 && dragStart && totalDragDist < 8) {
+      triggerPulse();
+      if (isPointOnFlower(e.clientX, e.clientY)) {
+        if (modalOpenTimer) clearTimeout(modalOpenTimer);
+        modalOpenTimer = setTimeout(openVaultModal, 180);
+      }
+    }
+    if (pointers.size === 0) {
+      dragStart = null;
+    }
+  }
+
+  canvas.addEventListener('pointerup', onPointerEnd);
+  canvas.addEventListener('pointercancel', onPointerEnd);
+
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    state.distance = Math.max(2.35, Math.min(8.4, state.distance + e.deltaY * 0.0034));
+  }, { passive: false });
+
+  /* =========================================================================
+   * Procedural 3D Botanical Geometry Builders
+   * ========================================================================= */
+  const SPECIES_PRESETS = {
+    lotus: {
+      shapeType: 0.0,
+      tiers: [
+        { count: 5,  len: 0.88, wid: 0.30, closed: 0.14, open: 0.44, cup: 0.14, arch: 0.10, curl: 0.11, baseY: 0.05 },
+        { count: 8,  len: 1.06, wid: 0.37, closed: 0.22, open: 0.78, cup: 0.17, arch: 0.13, curl: 0.17, baseY: 0.03 },
+        { count: 10, len: 1.24, wid: 0.41, closed: 0.31, open: 1.12, cup: 0.16, arch: 0.14, curl: 0.23, baseY: 0.01 },
+        { count: 9,  len: 1.18, wid: 0.34, closed: 0.42, open: 1.44, cup: 0.12, arch: 0.12, curl: 0.28, baseY: -0.02 }
+      ],
+      stamenCount: 28,
+      stamenScale: 1.0,
+      coreHeight: 0.24
+    },
+    rose: {
+      shapeType: 1.0,
+      tiers: [
+        { count: 5,  len: 0.72, wid: 0.33, closed: 0.08, open: 0.26, cup: 0.18, arch: 0.14, curl: 0.08, baseY: 0.06 },
+        { count: 8,  len: 0.86, wid: 0.40, closed: 0.15, open: 0.52, cup: 0.20, arch: 0.16, curl: 0.18, baseY: 0.04 },
+        { count: 11, len: 1.00, wid: 0.46, closed: 0.22, open: 0.82, cup: 0.19, arch: 0.15, curl: 0.28, baseY: 0.01 },
+        { count: 12, len: 1.08, wid: 0.48, closed: 0.30, open: 1.18, cup: 0.15, arch: 0.12, curl: 0.34, baseY: -0.02 }
+      ],
+      stamenCount: 20,
+      stamenScale: 0.76,
+      coreHeight: 0.28
+    },
+    sundrop: {
+      shapeType: 3.0,
+      tiers: [
+        { count: 3, len: 1.50, wid: 0.44, closed: 0.14, open: 0.62, cup: 0.20, arch: 0.16, curl: 0.36, baseY: 0.04 },
+        { count: 3, len: 1.46, wid: 0.38, closed: 0.20, open: 0.84, cup: 0.17, arch: 0.14, curl: 0.44, baseY: 0.01 }
+      ],
+      stamenCount: 6,
+      stamenScale: 1.55,
+      coreHeight: 0.20
+    },
+    lily: {
+      shapeType: 2.0,
+      tiers: [
+        { count: 3, len: 1.52, wid: 0.42, closed: 0.14, open: 0.94, cup: 0.15, arch: 0.08, curl: 0.46, baseY: 0.04 },
+        { count: 3, len: 1.48, wid: 0.36, closed: 0.22, open: 1.08, cup: 0.13, arch: 0.09, curl: 0.52, baseY: 0.01 }
+      ],
+      stamenCount: 6,
+      stamenScale: 1.6,
+      coreHeight: 0.18
+    }
+  };
+
+  function buildPetalsData(speciesKey) {
+    const spec = SPECIES_PRESETS[speciesKey] || SPECIES_PRESETS.sundrop;
+    const isLilyFamily = speciesKey === 'lily' || speciesKey === 'sundrop';
+    const U_SEGS = 14;
+    const V_SEGS = 18;
+
+    const surfUV = [];
+    const surfA = [];
+    const surfB = [];
+    const surfC = [];
+    const surfIndices = [];
+
+    const lineUV = [];
+    const lineA = [];
+    const lineB = [];
+    const lineC = [];
+    const lineAlpha = [];
+
+    const goldenOffset = 2.39996323;
+    let totalPetals = 0;
+    const tierCount = spec.tiers.length;
+
+    for (let t = 0; t < tierCount; t++) {
+      const tier = spec.tiers[t];
+      const tierNorm = tierCount > 1 ? t / (tierCount - 1) : 0.5;
+
+      for (let i = 0; i < tier.count; i++) {
+        const az = isLilyFamily
+          ? (i / tier.count) * Math.PI * 2 + t * (Math.PI / 3)
+          : (i / tier.count) * Math.PI * 2 + t * goldenOffset * 0.65;
+        const phase = totalPetals * 1.17;
+        const pA = [az, tier.closed, tier.open, tier.len * (0.96 + 0.08 * Math.sin(i * 1.9 + t))];
+        const pB = [tier.wid, tier.cup, tier.curl, phase];
+        const pC = [tierNorm, spec.shapeType, tier.arch, tier.baseY];
+
+        const baseVert = surfUV.length / 2;
+
+        // Surface grid
+        for (let iv = 0; iv <= V_SEGS; iv++) {
+          const v = iv / V_SEGS;
+          for (let iu = 0; iu <= U_SEGS; iu++) {
+            const u = (iu / U_SEGS) * 2 - 1;
+            surfUV.push(u, v);
+            surfA.push(pA[0], pA[1], pA[2], pA[3]);
+            surfB.push(pB[0], pB[1], pB[2], pB[3]);
+            surfC.push(pC[0], pC[1], pC[2], pC[3]);
+          }
+        }
+
+        const stride = U_SEGS + 1;
+        for (let iv = 0; iv < V_SEGS; iv++) {
+          for (let iu = 0; iu < U_SEGS; iu++) {
+            const a = baseVert + iv * stride + iu;
+            const b = a + 1;
+            const c = a + stride;
+            const d = c + 1;
+            surfIndices.push(a, b, d, a, d, c);
+          }
+        }
+
+        // Vein & Silhouette Wireframe Lines
+        const pushLineSeg = (u0, v0, u1, v1, alpha) => {
+          lineUV.push(u0, v0, u1, v1);
+          lineA.push(pA[0], pA[1], pA[2], pA[3], pA[0], pA[1], pA[2], pA[3]);
+          lineB.push(pB[0], pB[1], pB[2], pB[3], pB[0], pB[1], pB[2], pB[3]);
+          lineC.push(pC[0], pC[1], pC[2], pC[3], pC[0], pC[1], pC[2], pC[3]);
+          lineAlpha.push(alpha, alpha);
+        };
+
+        // Longitudinal veins: outer borders + midrib + delicate inner ribs
+        const uTracks = [
+          { u: -1.0, alpha: 0.95 },
+          { u: -0.66, alpha: 0.32 },
+          { u: -0.33, alpha: 0.40 },
+          { u: 0.0, alpha: 0.85 },
+          { u: 0.33, alpha: 0.40 },
+          { u: 0.66, alpha: 0.32 },
+          { u: 1.0, alpha: 0.95 }
+        ];
+        for (const tr of uTracks) {
+          for (let iv = 0; iv < V_SEGS; iv++) {
+            pushLineSeg(tr.u, iv / V_SEGS, tr.u, (iv + 1) / V_SEGS, tr.alpha);
+          }
+        }
+
+        // Selective transverse holographic contour arcs
+        const vRings = [0.28, 0.54, 0.78];
+        for (const vr of vRings) {
+          for (let iu = 0; iu < U_SEGS; iu++) {
+            const u0 = (iu / U_SEGS) * 2 - 1;
+            const u1 = ((iu + 1) / U_SEGS) * 2 - 1;
+            pushLineSeg(u0, vr, u1, vr, 0.24);
+          }
+        }
+
+        totalPetals++;
+      }
+    }
+
+    return {
+      surfUV: new Float32Array(surfUV),
+      surfA: new Float32Array(surfA),
+      surfB: new Float32Array(surfB),
+      surfC: new Float32Array(surfC),
+      surfIndices: new Uint16Array(surfIndices),
+      lineUV: new Float32Array(lineUV),
+      lineA: new Float32Array(lineA),
+      lineB: new Float32Array(lineB),
+      lineC: new Float32Array(lineC),
+      lineAlpha: new Float32Array(lineAlpha),
+      lineVertexCount: lineUV.length / 2
+    };
+  }
+
+  function stemCenter(t) {
+    // t=0 at top receptacle (y=0.05), t=1 at base (y=-1.75)
+    const y = 0.05 - t * 1.80;
+    const x = Math.sin(t * Math.PI * 1.15) * 0.075;
+    const z = Math.sin(t * Math.PI * 1.85) * 0.042;
+    return [x, y, z];
+  }
+
+  function buildStemAndLeaves(speciesKey) {
+    const spec = SPECIES_PRESETS[speciesKey] || SPECIES_PRESETS.lotus;
+    const pos = [];
+    const norm = [];
+    const kind = []; // x: surface type (0=stem/leaf, 1=core), y: edge/tip weight
+    const surfIdx = [];
+    const linePos = [];
+    const lineAlpha = [];
+
+    const pushTriMesh = (verts, norms, kinds, indices) => {
+      const base = pos.length / 3;
+      for (let i = 0; i < verts.length; i++) pos.push(verts[i]);
+      for (let i = 0; i < norms.length; i++) norm.push(norms[i]);
+      for (let i = 0; i < kinds.length; i++) kind.push(kinds[i]);
+      for (let i = 0; i < indices.length; i++) surfIdx.push(base + indices[i]);
+    };
+
+    // 1. Curved Tubular Stem + Receptacle Cup
+    const STEM_H = 34;
+    const STEM_R = 14;
+    const sVerts = [];
+    const sNorms = [];
+    const sKinds = [];
+    const sIdx = [];
+
+    for (let iy = 0; iy <= STEM_H; iy++) {
+      const t = iy / STEM_H;
+      const c = stemCenter(t);
+      // Flair slightly at top receptacle (t near 0) and base anchor
+      const radius = 0.032 + 0.078 * Math.exp(-t * 14.0) + 0.012 * Math.sin(t * Math.PI);
+      for (let ir = 0; ir <= STEM_R; ir++) {
+        const a = (ir / STEM_R) * Math.PI * 2;
+        const ca = Math.cos(a);
+        const sa = Math.sin(a);
+        sVerts.push(c[0] + ca * radius, c[1], c[2] + sa * radius);
+        sNorms.push(ca, 0.15 * Math.exp(-t * 8.0), sa);
+        sKinds.push(0.0, 1.0 - t);
+      }
+    }
+    const sStride = STEM_R + 1;
+    for (let iy = 0; iy < STEM_H; iy++) {
+      for (let ir = 0; ir < STEM_R; ir++) {
+        const a = iy * sStride + ir;
+        const b = a + 1;
+        const c = a + sStride;
+        const d = c + 1;
+        sIdx.push(a, b, d, a, d, c);
+      }
+    }
+    pushTriMesh(sVerts, sNorms, sKinds, sIdx);
+
+    // Stem holographic vertical & ring lines
+    for (let ir = 0; ir < STEM_R; ir += 2) {
+      for (let iy = 0; iy < STEM_H; iy++) {
+        const i0 = (iy * sStride + ir) * 3;
+        const i1 = ((iy + 1) * sStride + ir) * 3;
+        linePos.push(sVerts[i0], sVerts[i0 + 1], sVerts[i0 + 2], sVerts[i1], sVerts[i1 + 1], sVerts[i1 + 2]);
+        lineAlpha.push(0.45, 0.45);
+      }
+    }
+    for (let iy = 3; iy < STEM_H; iy += 5) {
+      for (let ir = 0; ir < STEM_R; ir++) {
+        const i0 = (iy * sStride + ir) * 3;
+        const i1 = (iy * sStride + ir + 1) * 3;
+        linePos.push(sVerts[i0], sVerts[i0 + 1], sVerts[i0 + 2], sVerts[i1], sVerts[i1 + 1], sVerts[i1 + 2]);
+        lineAlpha.push(0.35, 0.35);
+      }
+    }
+
+    // 2. Sculpted Glowing Core / Pistil Dome
+    const C_RINGS = 10;
+    const C_SEGS = 18;
+    const cVerts = [];
+    const cNorms = [];
+    const cKinds = [];
+    const cIdx = [];
+    for (let ir = 0; ir <= C_RINGS; ir++) {
+      const v = ir / C_RINGS;
+      const phi = v * Math.PI * 0.52;
+      const r = Math.sin(phi) * 0.145;
+      const y = 0.05 + (1.0 - Math.cos(phi)) * spec.coreHeight;
+      for (let is = 0; is <= C_SEGS; is++) {
+        const th = (is / C_SEGS) * Math.PI * 2;
+        const nx = Math.sin(phi) * Math.cos(th);
+        const nz = Math.sin(phi) * Math.sin(th);
+        const ny = Math.cos(phi);
+        cVerts.push(nx * 0.145, y, nz * 0.145);
+        cNorms.push(nx, ny, nz);
+        cKinds.push(1.0, v);
+      }
+    }
+    const cStride = C_SEGS + 1;
+    for (let ir = 0; ir < C_RINGS; ir++) {
+      for (let is = 0; is < C_SEGS; is++) {
+        const a = ir * cStride + is;
+        const b = a + 1;
+        const c = a + cStride;
+        const d = c + 1;
+        cIdx.push(a, b, d, a, d, c);
+      }
+    }
+    pushTriMesh(cVerts, cNorms, cKinds, cIdx);
+
+    // Core grid rings
+    for (let ir = 2; ir <= C_RINGS; ir += 2) {
+      for (let is = 0; is < C_SEGS; is++) {
+        const i0 = (ir * cStride + is) * 3;
+        const i1 = (ir * cStride + is + 1) * 3;
+        linePos.push(cVerts[i0], cVerts[i0 + 1], cVerts[i0 + 2], cVerts[i1], cVerts[i1 + 1], cVerts[i1 + 2]);
+        lineAlpha.push(0.75, 0.75);
+      }
+    }
+
+    // 3. Three Sculpted 3D Stem Leaves
+    const leaves = [
+      { t: 0.36, az: 0.45, len: 0.76, wid: 0.22, droop: 0.36 },
+      { t: 0.54, az: 2.65, len: 0.86, wid: 0.25, droop: 0.42 },
+      { t: 0.72, az: 4.75, len: 0.70, wid: 0.20, droop: 0.34 }
+    ];
+    for (const lf of leaves) {
+      const origin = stemCenter(lf.t);
+      const ca = Math.cos(lf.az);
+      const sa = Math.sin(lf.az);
+      const LU = 10;
+      const LV = 14;
+      const lVerts = [];
+      const lNorms = [];
+      const lKinds = [];
+      const lIdx = [];
+
+      const leafPt = (u, v) => {
+        const vc = Math.max(v, 0.0001);
+        const halfW = lf.wid * (0.08 * (1 - v) + 0.92 * Math.sin(Math.pow(vc, 0.65) * Math.PI));
+        const px = u * halfW;
+        const reach = v * lf.len;
+        const arcY = 0.28 * Math.sin(v * Math.PI * 0.78) - lf.droop * v * v + 0.032 * Math.abs(u) * Math.sin(v * Math.PI);
+        const localR = 0.035 + reach;
+        return [
+          origin[0] + px * ca + localR * sa,
+          origin[1] + arcY,
+          origin[2] - px * sa + localR * ca
+        ];
+      };
+
+      for (let iv = 0; iv <= LV; iv++) {
+        const v = iv / LV;
+        for (let iu = 0; iu <= LU; iu++) {
+          const u = (iu / LU) * 2 - 1;
+          const p = leafPt(u, v);
+          const du = u > 0.96 ? -0.02 : 0.02;
+          const dv = v > 0.96 ? -0.02 : 0.02;
+          const pu = leafPt(u + du, v);
+          const pv = leafPt(u, v + dv);
+          const cr = cross3(
+            (pu[0] - p[0]) / du, (pu[1] - p[1]) / du, (pu[2] - p[2]) / du,
+            (pv[0] - p[0]) / dv, (pv[1] - p[1]) / dv, (pv[2] - p[2]) / dv
+          );
+          const cl = Math.hypot(cr[0], cr[1], cr[2]);
+          const n = cl > 1e-5 ? [cr[0] / cl, cr[1] / cl, cr[2] / cl] : [0, 1, 0];
+          lVerts.push(p[0], p[1], p[2]);
+          lNorms.push(n[0], n[1], n[2]);
+          lKinds.push(0.0, Math.max(Math.abs(u), v));
+        }
+      }
+      const lStride = LU + 1;
+      for (let iv = 0; iv < LV; iv++) {
+        for (let iu = 0; iu < LU; iu++) {
+          const a = iv * lStride + iu;
+          const b = a + 1;
+          const c = a + lStride;
+          const d = c + 1;
+          lIdx.push(a, b, d, a, d, c);
+        }
+      }
+      pushTriMesh(lVerts, lNorms, lKinds, lIdx);
+
+      // Leaf perimeter, midrib, and herringbone veins
+      for (let iv = 0; iv < LV; iv++) {
+        const v0 = iv / LV;
+        const v1 = (iv + 1) / LV;
+        for (const uEdge of [-1, 0, 1]) {
+          const p0 = leafPt(uEdge, v0);
+          const p1 = leafPt(uEdge, v1);
+          linePos.push(p0[0], p0[1], p0[2], p1[0], p1[1], p1[2]);
+          const alpha = uEdge === 0 ? 0.85 : 0.78;
+          lineAlpha.push(alpha, alpha);
+        }
+        if (iv > 1 && iv < LV - 1 && iv % 2 === 0) {
+          const pMid = leafPt(0, v0);
+          const pL = leafPt(-0.88, Math.min(1, v0 + 0.14));
+          const pR = leafPt(0.88, Math.min(1, v0 + 0.14));
+          linePos.push(pMid[0], pMid[1], pMid[2], pL[0], pL[1], pL[2]);
+          lineAlpha.push(0.45, 0.25);
+          linePos.push(pMid[0], pMid[1], pMid[2], pR[0], pR[1], pR[2]);
+          lineAlpha.push(0.45, 0.25);
+        }
+      }
+    }
+
+    // 4. Stamen Filaments, Elongated Anthers & Pistil Style
+    const stamenLinePos = [];
+    const stamenLineAlpha = [];
+    const antherPos = [];
+    const antherSize = [];
+    const antherSeed = [];
+    const count = spec.stamenCount;
+    const sc = spec.stamenScale;
+
+    if (speciesKey === 'lily' || speciesKey === 'sundrop') {
+      // 6 sweeping curved lily stamens with oblong T-bar anthers
+      for (let i = 0; i < 6; i++) {
+        const az = i * (Math.PI / 3) + 0.16;
+        const rad = speciesKey === 'sundrop' ? 0.29 : 0.36;
+        const height = speciesKey === 'sundrop' ? 0.78 : 0.74;
+        const segs = 10;
+        let prev = null;
+        for (let s = 0; s <= segs; s++) {
+          const t = s / segs;
+          const r = 0.025 + rad * Math.pow(t, 1.35) + 0.05 * Math.sin(t * Math.PI);
+          const y = 0.10 + height * Math.sin(t * Math.PI * 0.54) + 0.05 * t;
+          const x = Math.cos(az) * r;
+          const z = Math.sin(az) * r;
+          if (prev) {
+            stamenLinePos.push(prev[0], prev[1], prev[2], x, y, z);
+            stamenLineAlpha.push(0.55 + 0.4 * t, 0.55 + 0.4 * t);
+          }
+          prev = [x, y, z];
+        }
+        // Oblong horizontal anther bar perpendicular to radial direction
+        const tx = -Math.sin(az) * 0.068;
+        const tz = Math.cos(az) * 0.068;
+        stamenLinePos.push(
+          prev[0] - tx, prev[1] + 0.014, prev[2] - tz,
+          prev[0] + tx, prev[1] - 0.014, prev[2] + tz
+        );
+        stamenLineAlpha.push(0.95, 0.95);
+
+        antherPos.push(prev[0], prev[1], prev[2]);
+        antherSize.push(17.5);
+        antherSeed.push(i * 0.8);
+      }
+
+      // Tall central pistil style + 3-lobed stigma star
+      const styleSegs = 10;
+      let prevStyle = null;
+      for (let s = 0; s <= styleSegs; s++) {
+        const t = s / styleSegs;
+        const x = Math.sin(t * Math.PI) * 0.025;
+        const z = Math.sin(t * Math.PI * 0.7) * 0.02;
+        const y = 0.10 + t * 0.80;
+        if (prevStyle) {
+          stamenLinePos.push(prevStyle[0], prevStyle[1], prevStyle[2], x, y, z);
+          stamenLineAlpha.push(0.75, 0.92);
+        }
+        prevStyle = [x, y, z];
+      }
+      for (let k = 0; k < 3; k++) {
+        const sa = k * ((Math.PI * 2) / 3);
+        stamenLinePos.push(
+          prevStyle[0], prevStyle[1], prevStyle[2],
+          prevStyle[0] + Math.cos(sa) * 0.065, prevStyle[1] + 0.032, prevStyle[2] + Math.sin(sa) * 0.065
+        );
+        stamenLineAlpha.push(0.95, 0.95);
+        antherPos.push(prevStyle[0] + Math.cos(sa) * 0.055, prevStyle[1] + 0.028, prevStyle[2] + Math.sin(sa) * 0.055);
+        antherSize.push(11.0);
+        antherSeed.push(k * 1.1);
+      }
+      if (speciesKey === 'sundrop') {
+        antherPos.push(0, 0.30, 0);
+        antherSize.push(44.0);
+        antherSeed.push(0.0);
+      }
+    } else {
+      for (let i = 0; i < count; i++) {
+        const frac = (i + 0.5) / count;
+        const az = i * 2.39996323;
+        const rad = 0.045 + 0.14 * Math.sqrt(frac);
+        const height = (0.28 + 0.24 * (1.0 - frac * 0.65)) * sc;
+        const segs = 7;
+        let prev = null;
+        for (let s = 0; s <= segs; s++) {
+          const t = s / segs;
+          const r = 0.025 + rad * Math.pow(t, 0.72) + 0.04 * sc * Math.sin(t * Math.PI * 0.8);
+          const y = 0.10 + height * t + 0.04 * sc * Math.sin(t * Math.PI);
+          const x = Math.cos(az) * r;
+          const z = Math.sin(az) * r;
+          if (prev) {
+            stamenLinePos.push(prev[0], prev[1], prev[2], x, y, z);
+            stamenLineAlpha.push(0.4 + 0.45 * t, 0.4 + 0.45 * (s / segs));
+          }
+          prev = [x, y, z];
+        }
+        antherPos.push(prev[0], prev[1], prev[2]);
+        antherSize.push(10.5);
+        antherSeed.push(i * 0.47);
+      }
+    }
+
+    return {
+      surfPos: new Float32Array(pos),
+      surfNorm: new Float32Array(norm),
+      surfKind: new Float32Array(kind),
+      surfIdx: new Uint16Array(surfIdx),
+      linePos: new Float32Array(linePos),
+      lineAlpha: new Float32Array(lineAlpha),
+      stamenPos: new Float32Array(stamenLinePos),
+      stamenAlpha: new Float32Array(stamenLineAlpha),
+      antherPos: new Float32Array(antherPos),
+      antherSize: new Float32Array(antherSize),
+      antherSeed: new Float32Array(antherSeed)
+    };
+  }
+
+  function buildEmitterPedestal() {
+    const baseY = -1.84;
+
+    // Rotating concentric reticle rings (two groups spinning in opposite directions)
+    const makeRingLines = (rings) => {
+      const lp = [];
+      const la = [];
+      for (const rg of rings) {
+        const segs = rg.segs || 72;
+        for (let i = 0; i < segs; i++) {
+          if (rg.dashed && i % 2 === 1) continue;
+          const a0 = (i / segs) * Math.PI * 2;
+          const a1 = ((i + 1) / segs) * Math.PI * 2;
+          lp.push(
+            Math.cos(a0) * rg.r, rg.y, Math.sin(a0) * rg.r,
+            Math.cos(a1) * rg.r, rg.y, Math.sin(a1) * rg.r
+          );
+          la.push(rg.alpha, rg.alpha);
+        }
+        if (rg.ticks) {
+          for (let i = 0; i < rg.ticks; i++) {
+            const a = (i / rg.ticks) * Math.PI * 2;
+            const inner = rg.r - rg.tickLen;
+            const outer = rg.r + rg.tickLen * 0.4;
+            lp.push(
+              Math.cos(a) * inner, rg.y, Math.sin(a) * inner,
+              Math.cos(a) * outer, rg.y, Math.sin(a) * outer
+            );
+            la.push(rg.alpha * 0.9, rg.alpha * 0.4);
+          }
+        }
+      }
+      return { pos: new Float32Array(lp), alpha: new Float32Array(la) };
+    };
+
+    const ringOuter = makeRingLines([
+      { r: 1.06, y: baseY, segs: 96, alpha: 0.55, ticks: 24, tickLen: 0.09 },
+      { r: 0.88, y: baseY - 0.02, segs: 72, dashed: true, alpha: 0.72 },
+      { r: 0.34, y: baseY + 0.04, segs: 6, alpha: 0.65 }
+    ]);
+
+    const ringInner = makeRingLines([
+      { r: 0.70, y: baseY + 0.02, segs: 64, alpha: 0.68, ticks: 12, tickLen: 0.07 },
+      { r: 0.50, y: baseY + 0.03, segs: 48, dashed: true, alpha: 0.52 },
+      { r: 0.19, y: baseY + 0.05, segs: 36, alpha: 0.85 }
+    ]);
+
+    // Volumetric projection light cone rising from emitter
+    const conePos = [];
+    const coneNorm = [];
+    const coneKind = [];
+    const coneIdx = [];
+    const SEGS = 48;
+    const rBot = 0.32;
+    const rTop = 1.48;
+    const yTop = 0.85;
+
+    for (let i = 0; i <= SEGS; i++) {
+      const a = (i / SEGS) * Math.PI * 2;
+      const ca = Math.cos(a);
+      const sa = Math.sin(a);
+      conePos.push(ca * rBot, baseY + 0.02, sa * rBot);
+      coneNorm.push(ca, 0.25, sa);
+      coneKind.push(2.0, 1.0); // kind 2 = emitter beam cone, y = bottom opacity
+
+      conePos.push(ca * rTop, yTop, sa * rTop);
+      coneNorm.push(ca, 0.25, sa);
+      coneKind.push(2.0, 0.0); // fades smoothly to 0 at top
+    }
+    for (let i = 0; i < SEGS; i++) {
+      const a = i * 2;
+      const b = a + 1;
+      const c = a + 2;
+      const d = a + 3;
+      coneIdx.push(a, c, d, a, d, b);
+    }
+
+    return {
+      ringOuter,
+      ringInner,
+      conePos: new Float32Array(conePos),
+      coneNorm: new Float32Array(coneNorm),
+      coneKind: new Float32Array(coneKind),
+      coneIdx: new Uint16Array(coneIdx)
+    };
+  }
+
+  function buildSpores(count) {
+    const data = new Float32Array(count * 4); // radius, speed, phase, size
+    for (let i = 0; i < count; i++) {
+      data[i * 4]     = 0.18 + Math.random() * 1.45;
+      data[i * 4 + 1] = 0.16 + Math.random() * 0.38;
+      data[i * 4 + 2] = Math.random() * Math.PI * 2;
+      data[i * 4 + 3] = 4.5 + Math.random() * 9.5;
+    }
+    return data;
+  }
+
+  /* =========================================================================
+   * WebGL Renderer vs Canvas 2D Fallback
+   * ========================================================================= */
+  function createWebGLRenderer() {
+    if (!gl) return null;
+
+    const compileShader = (type, src) => {
+      const sh = gl.createShader(type);
+      gl.shaderSource(sh, src);
+      gl.compileShader(sh);
+      if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+        console.error('Shader error:', gl.getShaderInfoLog(sh));
+        gl.deleteShader(sh);
+        return null;
+      }
+      return sh;
+    };
+
+    const createProgram = (vsSrc, fsSrc) => {
+      const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
+      const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
+      if (!vs || !fs) return null;
+      const prog = gl.createProgram();
+      gl.attachShader(prog, vs);
+      gl.attachShader(prog, fs);
+      gl.linkProgram(prog);
+      if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+        console.error('Program link error:', gl.getProgramInfoLog(prog));
+        return null;
+      }
+      return prog;
+    };
+
+    const precisionHdr = `
+      #ifdef GL_FRAGMENT_PRECISION_HIGH
+      precision highp float;
+      #else
+      precision mediump float;
+      #endif
+    `;
+
+    const petalEvalGLSL = `
+      uniform float uTime;
+      uniform float uBloom;
+      uniform float uPulse;
+      uniform float uPulseTime;
+      uniform float uGlitch;
+
+      vec3 evalPetalPos(float u, float v, vec4 pA, vec4 pB, vec4 pC, out float outRipple) {
+        float az = pA.x;
+        float closedTilt = pA.y;
+        float openTilt = pA.z;
+        float len = pA.w;
+
+        float wid = pB.x;
+        float cup = pB.y;
+        float curl = pB.z;
+        float phase = pB.w;
+
+        float tierNorm = pC.x;
+        float shapeType = pC.y;
+        float arch = pC.z;
+        float baseY = pC.w;
+
+        float delay = (1.0 - tierNorm) * 0.34;
+        float localBloom = clamp((uBloom - delay) / max(1.0 - delay, 0.2), 0.0, 1.28);
+
+        outRipple = 0.0;
+        if (uPulse > 0.001) {
+          float waveDist = uPulseTime * 2.1 - tierNorm * 0.65 - v * 0.45;
+          outRipple = exp(-waveDist * waveDist * 13.0) * uPulse;
+        }
+
+        float breathe = sin(uTime * 1.15 + phase) * 0.026 * (0.35 + 0.65 * v);
+        float tilt = mix(closedTilt, openTilt, localBloom) + breathe + outRipple * 0.14;
+
+        float vc = clamp(v, 0.0001, 1.0);
+        float bellyExp = (shapeType > 1.5) ? 0.56 : ((shapeType > 0.5) ? 0.88 : 0.74);
+        float sinProfile = sin(pow(vc, bellyExp) * 3.14159265);
+        float baseClaw = (shapeType > 1.5) ? 0.09 : 0.16;
+        float halfW = wid * (baseClaw * (1.0 - v) + (1.0 - baseClaw) * sinProfile);
+
+        if (shapeType > 0.5 && shapeType < 1.5) {
+          halfW *= (1.0 + 0.18 * smoothstep(0.55, 0.9, v) * (1.0 - smoothstep(0.9, 1.0, v)));
+        }
+        if (shapeType > 1.5) {
+          halfW *= (1.0 - 0.24 * v * v);
+        }
+        halfW = max(halfW, 0.0025);
+
+        float px = u * halfW;
+        float py = v * len;
+
+        float vSin = sin(v * 3.14159265);
+        float cupZ = cup * (1.0 - u * u * 0.92) * vSin;
+        float archZ = -arch * sin(v * 2.55) * (0.4 + 0.6 * min(localBloom, 1.0));
+        float curlFactor = curl * (0.35 + 0.65 * clamp(localBloom, 0.0, 1.2));
+        float tipZ = curlFactor * v * v * v;
+        if (shapeType > 0.5 && shapeType < 1.5) {
+          tipZ += curlFactor * 0.26 * (u * u) * smoothstep(0.5, 1.0, v);
+        }
+        float veinRib = 0.013 * len * cos(u * 15.70796) * vSin * (1.0 - 0.4 * u * u);
+        float lilyWave = 0.0;
+        if (shapeType > 1.5) {
+          // Authentic wavy lily tepal edges + central nectar keel
+          lilyWave = 0.032 * sin(v * 20.0) * pow(max(abs(u), 0.0001), 1.65) * vSin
+                   + 0.032 * exp(-u * u * 16.0) * vSin;
+        }
+
+        float pz = cupZ + archZ + tipZ + veinRib + lilyWave;
+
+        float ct = cos(tilt);
+        float st = sin(tilt);
+        float ry = py * ct - pz * st;
+        float rz = py * st + pz * ct + 0.085 + tierNorm * 0.045;
+
+        float twist = az + sin(uTime * 0.65 + phase) * 0.015 * v;
+        float ca = cos(twist);
+        float sa = sin(twist);
+
+        vec3 wp;
+        wp.x = px * ca + rz * sa;
+        wp.z = -px * sa + rz * ca;
+        wp.y = ry + baseY + sin(uTime * 1.4) * 0.035;
+
+        if (uGlitch > 0.001) {
+          float slice = floor(wp.y * 18.0 + uTime * 9.0);
+          float rnd = fract(sin(slice * 91.3458 + floor(uTime * 14.0) * 17.13) * 47453.5453);
+          float glitchMask = step(0.945 - uGlitch * 0.06, rnd);
+          wp.x += (rnd - 0.5) * 0.13 * uGlitch * glitchMask;
+        }
+
+        return wp;
+      }
+    `;
+
+    const petalSurfVS = `
+      precision highp float;
+      attribute vec2 aUV;
+      attribute vec4 aPetalA;
+      attribute vec4 aPetalB;
+      attribute vec4 aPetalC;
+
+      uniform mat4 uViewProj;
+
+      varying vec3 vWorldPos;
+      varying vec3 vNormal;
+      varying vec2 vUV;
+      varying float vTierNorm;
+      varying float vRipple;
+      varying float vShapeType;
+
+      ${petalEvalGLSL}
+
+      void main() {
+        float rip = 0.0;
+        vec3 p0 = evalPetalPos(aUV.x, aUV.y, aPetalA, aPetalB, aPetalC, rip);
+
+        float vn = clamp(aUV.y, 0.015, 0.985);
+        float un = clamp(aUV.x, -0.985, 0.985);
+        float rTmp = 0.0;
+        vec3 pn = evalPetalPos(un, vn, aPetalA, aPetalB, aPetalC, rTmp);
+        float du = (un > 0.96) ? -0.006 : 0.006;
+        float dv = (vn > 0.96) ? -0.006 : 0.006;
+        vec3 dPdu = (evalPetalPos(un + du, vn, aPetalA, aPetalB, aPetalC, rTmp) - pn) / du;
+        vec3 dPdv = (evalPetalPos(un, vn + dv, aPetalA, aPetalB, aPetalC, rTmp) - pn) / dv;
+        vec3 cr = cross(dPdu, dPdv);
+        float cl = length(cr);
+        vec3 nrm = (cl > 0.00001) ? (cr / cl) : vec3(0.0, 1.0, 0.0);
+
+        vWorldPos = p0;
+        vNormal = nrm;
+        vUV = aUV;
+        vTierNorm = aPetalC.x;
+        vRipple = rip;
+        vShapeType = aPetalC.y;
+
+        gl_Position = uViewProj * vec4(p0, 1.0);
+      }
+    `;
+
+    const petalSurfFS = `
+      ${precisionHdr}
+      uniform vec3 uCameraPos;
+      uniform vec3 uColorInner;
+      uniform vec3 uColorOuter;
+      uniform vec3 uColorRim;
+      uniform float uTime;
+      uniform float uScanline;
+
+      varying vec3 vWorldPos;
+      varying vec3 vNormal;
+      varying vec2 vUV;
+      varying float vTierNorm;
+      varying float vRipple;
+      varying float vShapeType;
+
+      void main() {
+        vec3 V = normalize(uCameraPos - vWorldPos);
+        vec3 N = normalize(vNormal);
+        float ndotv = abs(dot(N, V));
+        float fresnel = pow(max(1.0 - ndotv, 0.0001), 2.1);
+
+        float edgeFactor = pow(max(abs(vUV.x), 0.0001), 3.0) * 0.55 + smoothstep(0.74, 1.0, vUV.y) * 0.45;
+        float microGrid = 0.5 + 0.5 * sin(vUV.x * 26.0) * sin(vUV.y * 22.0 - uTime * 1.6);
+
+        vec3 baseCol = mix(uColorInner, uColorOuter, clamp(vUV.y * 0.72 + vTierNorm * 0.36, 0.0, 1.0));
+        float lilyThroatGlow = 0.0;
+        if (vShapeType > 2.5) {
+          // Rapunzel Sundrop Lily: glowing liquid-sunlight chalice & radiant golden vein filaments
+          float sunHeart = (1.0 - smoothstep(0.0, 0.56, vUV.y)) * (0.65 + 0.35 * cos(vUV.x * 2.2));
+          float veinGlow = (0.5 + 0.5 * cos(vUV.x * 18.84955)) * exp(-abs(vUV.x) * 1.4) * (1.0 - vUV.y * 0.55);
+          float healPulse = 0.88 + 0.12 * sin(uTime * 2.6 - vUV.y * 4.5);
+          baseCol = mix(baseCol, uColorRim, clamp(sunHeart * 0.42 + veinGlow * 0.25, 0.0, 1.0));
+          baseCol *= healPulse;
+          lilyThroatGlow = sunHeart * 0.09 + veinGlow * 0.08;
+        } else if (vShapeType > 1.5) {
+          // Stargazer lily pattern: vivid center stripe & throat + luminous soft-white outer margin + nectar spots
+          float midStripe = exp(-vUV.x * vUV.x * 12.0) * (1.0 - smoothstep(0.05, 0.80, vUV.y));
+          float marginBand = smoothstep(0.62, 0.96, abs(vUV.x)) * smoothstep(0.10, 0.45, vUV.y);
+          float spots = smoothstep(0.72, 0.96, sin(vUV.x * 38.0) * sin(vUV.y * 42.0))
+                      * (1.0 - smoothstep(0.15, 0.65, vUV.y))
+                      * (1.0 - smoothstep(0.25, 0.72, abs(vUV.x)));
+          baseCol = mix(baseCol, uColorInner * 1.15, clamp(midStripe * 0.85, 0.0, 1.0));
+          baseCol = mix(baseCol, uColorRim, clamp(marginBand * 0.62, 0.0, 1.0));
+          baseCol += uColorInner * spots * 0.42;
+          lilyThroatGlow = midStripe * 0.14 + marginBand * 0.08 + spots * 0.12;
+        }
+        vec3 col = mix(baseCol, uColorRim, clamp(fresnel * 0.75 + edgeFactor * 0.25, 0.0, 1.0));
+        col += vec3(0.28, 0.34, 0.42) * pow(fresnel, 3.0) + vec3(0.6, 0.85, 1.0) * vRipple * 0.55;
+        col *= 0.88 + 0.16 * microGrid;
+
+        float scanWorld = 0.5 + 0.5 * sin(vWorldPos.y * 92.0 - uTime * 5.2);
+        float scanScreen = 0.5 + 0.5 * sin(gl_FragCoord.y * 1.15 + uTime * 2.4);
+        float scanMod = mix(1.0, 0.55 + 0.45 * mix(scanWorld, scanScreen, 0.42), uScanline);
+
+        float alpha = (0.095 + fresnel * 0.48 + edgeFactor * 0.22 + lilyThroatGlow + vRipple * 0.32) * scanMod;
+        gl_FragColor = vec4(col * scanMod, clamp(alpha, 0.0, 0.88));
+      }
+    `;
+
+    const petalLineVS = `
+      precision highp float;
+      attribute vec2 aUV;
+      attribute vec4 aPetalA;
+      attribute vec4 aPetalB;
+      attribute vec4 aPetalC;
+      attribute float aLineAlpha;
+
+      uniform mat4 uViewProj;
+
+      varying vec3 vWorldPos;
+      varying float vLineAlpha;
+      varying float vTierNorm;
+      varying float vRipple;
+      varying float vV;
+
+      ${petalEvalGLSL}
+
+      void main() {
+        float rip = 0.0;
+        vec3 p0 = evalPetalPos(aUV.x, aUV.y, aPetalA, aPetalB, aPetalC, rip);
+        vWorldPos = p0;
+        vLineAlpha = aLineAlpha;
+        vTierNorm = aPetalC.x;
+        vRipple = rip;
+        vV = aUV.y;
+        gl_Position = uViewProj * vec4(p0, 1.0);
+      }
+    `;
+
+    const lineFS = `
+      ${precisionHdr}
+      uniform vec3 uColorOuter;
+      uniform vec3 uColorRim;
+      uniform float uTime;
+      uniform float uScanline;
+
+      varying vec3 vWorldPos;
+      varying float vLineAlpha;
+      varying float vTierNorm;
+      varying float vRipple;
+      varying float vV;
+
+      void main() {
+        float scanWorld = 0.5 + 0.5 * sin(vWorldPos.y * 92.0 - uTime * 5.2);
+        float scanMod = mix(1.0, 0.65 + 0.35 * scanWorld, uScanline);
+        float travel = 0.5 + 0.5 * sin(vV * 12.0 - uTime * 3.8 - vTierNorm * 2.5);
+        vec3 col = mix(uColorOuter, uColorRim, 0.35 * vTierNorm + 0.25 * travel);
+        col += vec3(0.6, 0.85, 1.0) * (vRipple * 0.6 + 0.15 * travel);
+        float alpha = vLineAlpha * (0.62 + 0.28 * travel + vRipple * 0.45) * scanMod;
+        gl_FragColor = vec4(col, clamp(alpha, 0.0, 0.95));
+      }
+    `;
+
+    const meshSurfVS = `
+      precision highp float;
+      attribute vec3 aPos;
+      attribute vec3 aNorm;
+      attribute vec2 aKind; // x: 0=stem/leaf, 1=core, 2=cone; y: gradient param
+
+      uniform mat4 uViewProj;
+      uniform float uTime;
+      uniform float uFloatAmp;
+      uniform float uGlitch;
+
+      varying vec3 vWorldPos;
+      varying vec3 vNormal;
+      varying vec2 vKind;
+
+      void main() {
+        vec3 wp = aPos;
+        wp.y += sin(uTime * 1.4) * 0.035 * uFloatAmp;
+        if (uGlitch > 0.001 && uFloatAmp > 0.5) {
+          float slice = floor(wp.y * 18.0 + uTime * 9.0);
+          float rnd = fract(sin(slice * 91.3458 + floor(uTime * 14.0) * 17.13) * 47453.5453);
+          float glitchMask = step(0.95 - uGlitch * 0.05, rnd);
+          wp.x += (rnd - 0.5) * 0.11 * uGlitch * glitchMask;
+        }
+        vWorldPos = wp;
+        vNormal = aNorm;
+        vKind = aKind;
+        gl_Position = uViewProj * vec4(wp, 1.0);
+      }
+    `;
+
+    const meshSurfFS = `
+      ${precisionHdr}
+      uniform vec3 uCameraPos;
+      uniform vec3 uColorStem;
+      uniform vec3 uColorCore;
+      uniform vec3 uColorOuter;
+      uniform float uTime;
+      uniform float uPulse;
+      uniform float uPulseTime;
+      uniform float uScanline;
+
+      varying vec3 vWorldPos;
+      varying vec3 vNormal;
+      varying vec2 vKind;
+
+      void main() {
+        vec3 V = normalize(uCameraPos - vWorldPos);
+        vec3 N = normalize(vNormal);
+        float fresnel = pow(max(1.0 - abs(dot(N, V)), 0.0001), 2.0);
+        float scan = mix(1.0, 0.58 + 0.42 * (0.5 + 0.5 * sin(vWorldPos.y * 85.0 - uTime * 5.0)), uScanline);
+
+        if (vKind.x > 1.5) {
+          // Volumetric projection beam cone
+          float ray = 0.55 + 0.45 * sin(atan(vWorldPos.z, vWorldPos.x) * 12.0 + uTime * 1.1);
+          float ring = 0.65 + 0.35 * sin(vWorldPos.y * 14.0 - uTime * 3.5);
+          float alpha = pow(max(vKind.y, 0.0001), 1.65) * 0.068 * ray * ring * (1.0 - fresnel * 0.45);
+          gl_FragColor = vec4(uColorOuter, clamp(alpha, 0.0, 0.22));
+          return;
+        }
+
+        if (vKind.x > 0.5) {
+          // Glowing flower heart / pistil core
+          float pulseBoost = uPulse * exp(-uPulseTime * 2.2) * 0.85;
+          vec3 col = mix(uColorOuter, uColorCore, 0.55 + 0.45 * vKind.y) + vec3(0.4) * pulseBoost;
+          float alpha = (0.28 + fresnel * 0.55 + pulseBoost * 0.35) * scan;
+          gl_FragColor = vec4(col, clamp(alpha, 0.0, 0.92));
+          return;
+        }
+
+        // Stem and leaves with traveling upward energy pulse
+        float upWave = pow(0.5 + 0.5 * sin(vWorldPos.y * 9.0 - uTime * 4.2), 4.0);
+        vec3 col = mix(uColorStem, uColorOuter, fresnel * 0.6 + upWave * 0.35);
+        float alpha = (0.10 + fresnel * 0.42 + vKind.y * 0.08 + upWave * 0.14) * scan;
+        gl_FragColor = vec4(col, clamp(alpha, 0.0, 0.78));
+      }
+    `;
+
+    const meshLineVS = `
+      precision highp float;
+      attribute vec3 aPos;
+      attribute float aLineAlpha;
+
+      uniform mat4 uViewProj;
+      uniform float uTime;
+      uniform float uFloatAmp;
+      uniform float uLocalRotateY;
+
+      varying vec3 vWorldPos;
+      varying float vLineAlpha;
+
+      void main() {
+        float c = cos(uLocalRotateY);
+        float s = sin(uLocalRotateY);
+        vec3 wp;
+        wp.x = aPos.x * c + aPos.z * s;
+        wp.z = -aPos.x * s + aPos.z * c;
+        wp.y = aPos.y + sin(uTime * 1.4) * 0.035 * uFloatAmp;
+        vWorldPos = wp;
+        vLineAlpha = aLineAlpha;
+        gl_Position = uViewProj * vec4(wp, 1.0);
+      }
+    `;
+
+    const meshLineFS = `
+      ${precisionHdr}
+      uniform vec3 uColorLine;
+      uniform float uTime;
+      uniform float uScanline;
+
+      varying vec3 vWorldPos;
+      varying float vLineAlpha;
+
+      void main() {
+        float upPulse = 0.68 + 0.32 * sin(vWorldPos.y * 10.0 - uTime * 4.4);
+        float scan = mix(1.0, 0.7 + 0.3 * sin(vWorldPos.y * 85.0 - uTime * 5.0), uScanline);
+        gl_FragColor = vec4(uColorLine, clamp(vLineAlpha * upPulse * scan, 0.0, 0.95));
+      }
+    `;
+
+    const pointVS = `
+      precision highp float;
+      attribute vec3 aPos;
+      attribute float aSize;
+      attribute float aSeed;
+
+      uniform mat4 uViewProj;
+      uniform mat4 uView;
+      uniform float uTime;
+      uniform float uPixelRatio;
+      uniform float uIsSpore;
+      uniform float uPulse;
+      uniform float uPulseTime;
+
+      varying float vAlpha;
+      varying float vSeed;
+
+      void main() {
+        vec3 wp = aPos;
+        if (uIsSpore > 0.5) {
+          // aPos packs: x=radius, y=speed, z=phase
+          float r = aPos.x;
+          float spd = aPos.y;
+          float ph = aPos.z;
+          float cycle = fract(uTime * spd * 0.18 + ph * 0.15915);
+          float y = -1.72 + cycle * 3.15;
+          float ang = ph + uTime * (0.28 + spd * 0.45) + cycle * 1.8;
+          float flare = r * (0.35 + 0.72 * smoothstep(0.0, 0.75, cycle)) + uPulse * exp(-uPulseTime * 2.0) * 0.25;
+          wp = vec3(cos(ang) * flare, y, sin(ang) * flare);
+          vAlpha = sin(cycle * 3.14159265) * (0.45 + 0.45 * sin(uTime * 2.2 + ph));
+        } else {
+          wp.y += sin(uTime * 1.4) * 0.035;
+          vAlpha = 0.78 + 0.22 * sin(uTime * 3.2 + aSeed);
+        }
+
+        vSeed = aSeed;
+        vec4 viewPos = uView * vec4(wp, 1.0);
+        gl_Position = uViewProj * vec4(wp, 1.0);
+        float dist = max(-viewPos.z, 0.6);
+        gl_PointSize = clamp(aSize * uPixelRatio * (3.6 / dist), 1.5, 220.0 * uPixelRatio);
+      }
+    `;
+
+    const pointFS = `
+      ${precisionHdr}
+      uniform vec3 uColorCore;
+      uniform vec3 uColorRim;
+      uniform float uPointAlpha;
+
+      varying float vAlpha;
+      varying float vSeed;
+
+      void main() {
+        vec2 c = gl_PointCoord * 2.0 - 1.0;
+        float r2 = dot(c, c);
+        if (r2 > 1.0) discard;
+        float glow = exp(-r2 * 4.8);
+        vec3 col = mix(uColorCore, uColorRim, 0.35 * sin(vSeed) + 0.35);
+        gl_FragColor = vec4(col, glow * vAlpha * uPointAlpha);
+      }
+    `;
+
+    const bgVS = `
+      precision highp float;
+      attribute vec2 aQuad;
+      varying vec2 vScreen;
+      void main() {
+        vScreen = aQuad * 0.5 + 0.5;
+        gl_Position = vec4(aQuad, 0.0, 1.0);
+      }
+    `;
+
+    const bgFS = `
+      ${precisionHdr}
+      uniform vec3 uColorInner;
+      uniform vec3 uColorOuter;
+      varying vec2 vScreen;
+      void main() {
+        vec2 d = (vScreen - vec2(0.5, 0.54)) * vec2(1.25, 1.0);
+        float r = length(d);
+        float nebula = exp(-r * r * 3.2);
+        vec3 col = mix(vec3(0.004, 0.009, 0.022), mix(uColorInner, uColorOuter, 0.35) * 0.14, nebula);
+        gl_FragColor = vec4(col, 1.0);
+      }
+    `;
+
+    const petalSurfProg = createProgram(petalSurfVS, petalSurfFS);
+    const petalLineProg = createProgram(petalLineVS, lineFS);
+    const meshSurfProg  = createProgram(meshSurfVS, meshSurfFS);
+    const meshLineProg  = createProgram(meshLineVS, meshLineFS);
+    const pointProg     = createProgram(pointVS, pointFS);
+    const bgProg        = createProgram(bgVS, bgFS);
+
+    if (!petalSurfProg || !petalLineProg || !meshSurfProg || !meshLineProg || !pointProg || !bgProg) {
+      return null;
+    }
+
+    const loc = (prog, attribs, uniforms) => {
+      const a = {};
+      const u = {};
+      for (const name of attribs) a[name] = gl.getAttribLocation(prog, name);
+      for (const name of uniforms) u[name] = gl.getUniformLocation(prog, name);
+      return { prog, a, u };
+    };
+
+    const P_SURF = loc(
+      petalSurfProg,
+      ['aUV', 'aPetalA', 'aPetalB', 'aPetalC'],
+      ['uViewProj', 'uCameraPos', 'uTime', 'uBloom', 'uPulse', 'uPulseTime', 'uGlitch', 'uScanline', 'uColorInner', 'uColorOuter', 'uColorRim']
+    );
+    const P_LINE = loc(
+      petalLineProg,
+      ['aUV', 'aPetalA', 'aPetalB', 'aPetalC', 'aLineAlpha'],
+      ['uViewProj', 'uTime', 'uBloom', 'uPulse', 'uPulseTime', 'uGlitch', 'uScanline', 'uColorOuter', 'uColorRim']
+    );
+    const M_SURF = loc(
+      meshSurfProg,
+      ['aPos', 'aNorm', 'aKind'],
+      ['uViewProj', 'uCameraPos', 'uTime', 'uFloatAmp', 'uGlitch', 'uScanline', 'uPulse', 'uPulseTime', 'uColorStem', 'uColorCore', 'uColorOuter']
+    );
+    const M_LINE = loc(
+      meshLineProg,
+      ['aPos', 'aLineAlpha'],
+      ['uViewProj', 'uTime', 'uFloatAmp', 'uLocalRotateY', 'uScanline', 'uColorLine']
+    );
+    const PT_PROG = loc(
+      pointProg,
+      ['aPos', 'aSize', 'aSeed'],
+      ['uViewProj', 'uView', 'uTime', 'uPixelRatio', 'uIsSpore', 'uPulse', 'uPulseTime', 'uColorCore', 'uColorRim', 'uPointAlpha']
+    );
+    const BG_PROG = loc(
+      bgProg,
+      ['aQuad'],
+      ['uColorInner', 'uColorOuter']
+    );
+
+    const makeBuf = (target, data) => {
+      const b = gl.createBuffer();
+      gl.bindBuffer(target, b);
+      gl.bufferData(target, data, gl.STATIC_DRAW);
+      return b;
+    };
+
+    const enabledAttribs = new Set();
+    const bindAttr = (attrLoc, buf, size) => {
+      if (attrLoc < 0) return;
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.vertexAttribPointer(attrLoc, size, gl.FLOAT, false, 0, 0);
+      if (!enabledAttribs.has(attrLoc)) {
+        gl.enableVertexAttribArray(attrLoc);
+        enabledAttribs.add(attrLoc);
+      }
+    };
+    const clearUnusedAttribs = (keepList) => {
+      const keep = new Set(keepList);
+      for (const id of Array.from(enabledAttribs)) {
+        if (!keep.has(id)) {
+          gl.disableVertexAttribArray(id);
+          enabledAttribs.delete(id);
+        }
+      }
+    };
+
+    // Static Pedestal & Spores
+    const pedestal = buildEmitterPedestal();
+    const pedBuffers = {
+      outerPos: makeBuf(gl.ARRAY_BUFFER, pedestal.ringOuter.pos),
+      outerAlpha: makeBuf(gl.ARRAY_BUFFER, pedestal.ringOuter.alpha),
+      outerCount: pedestal.ringOuter.pos.length / 3,
+      innerPos: makeBuf(gl.ARRAY_BUFFER, pedestal.ringInner.pos),
+      innerAlpha: makeBuf(gl.ARRAY_BUFFER, pedestal.ringInner.alpha),
+      innerCount: pedestal.ringInner.pos.length / 3,
+      conePos: makeBuf(gl.ARRAY_BUFFER, pedestal.conePos),
+      coneNorm: makeBuf(gl.ARRAY_BUFFER, pedestal.coneNorm),
+      coneKind: makeBuf(gl.ARRAY_BUFFER, pedestal.coneKind),
+      coneIdx: makeBuf(gl.ELEMENT_ARRAY_BUFFER, pedestal.coneIdx),
+      coneCount: pedestal.coneIdx.length
+    };
+
+    const SPORE_COUNT = 220;
+    const sporeRaw = buildSpores(SPORE_COUNT);
+    const sporePosArr = new Float32Array(SPORE_COUNT * 3);
+    const sporeSizeArr = new Float32Array(SPORE_COUNT);
+    const sporeSeedArr = new Float32Array(SPORE_COUNT);
+    for (let i = 0; i < SPORE_COUNT; i++) {
+      sporePosArr[i * 3]     = sporeRaw[i * 4];
+      sporePosArr[i * 3 + 1] = sporeRaw[i * 4 + 1];
+      sporePosArr[i * 3 + 2] = sporeRaw[i * 4 + 2];
+      sporeSizeArr[i]        = sporeRaw[i * 4 + 3];
+      sporeSeedArr[i]        = sporeRaw[i * 4 + 2];
+    }
+    const sporeBuffers = {
+      pos: makeBuf(gl.ARRAY_BUFFER, sporePosArr),
+      size: makeBuf(gl.ARRAY_BUFFER, sporeSizeArr),
+      seed: makeBuf(gl.ARRAY_BUFFER, sporeSeedArr),
+      count: SPORE_COUNT
+    };
+
+    const bgQuadBuf = makeBuf(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]));
+    const haloBuffers = {
+      pos: makeBuf(gl.ARRAY_BUFFER, new Float32Array([0, 0.28, 0, 0, -1.80, 0])),
+      size: makeBuf(gl.ARRAY_BUFFER, new Float32Array([148.0, 95.0])),
+      seed: makeBuf(gl.ARRAY_BUFFER, new Float32Array([0.0, 1.5])),
+      count: 2
+    };
+
+    let floraBuffers = null;
+
+    const rebuildFlora = () => {
+      if (floraBuffers) {
+        Object.values(floraBuffers).forEach(v => {
+          if (v && typeof v === 'object' && v instanceof WebGLBuffer) gl.deleteBuffer(v);
+        });
+      }
+      const pData = buildPetalsData(state.species);
+      const sData = buildStemAndLeaves(state.species);
+      floraBuffers = {
+        pSurfUV: makeBuf(gl.ARRAY_BUFFER, pData.surfUV),
+        pSurfA: makeBuf(gl.ARRAY_BUFFER, pData.surfA),
+        pSurfB: makeBuf(gl.ARRAY_BUFFER, pData.surfB),
+        pSurfC: makeBuf(gl.ARRAY_BUFFER, pData.surfC),
+        pSurfIdx: makeBuf(gl.ELEMENT_ARRAY_BUFFER, pData.surfIndices),
+        pSurfCount: pData.surfIndices.length,
+
+        pLineUV: makeBuf(gl.ARRAY_BUFFER, pData.lineUV),
+        pLineA: makeBuf(gl.ARRAY_BUFFER, pData.lineA),
+        pLineB: makeBuf(gl.ARRAY_BUFFER, pData.lineB),
+        pLineC: makeBuf(gl.ARRAY_BUFFER, pData.lineC),
+        pLineAlpha: makeBuf(gl.ARRAY_BUFFER, pData.lineAlpha),
+        pLineCount: pData.lineVertexCount,
+
+        sSurfPos: makeBuf(gl.ARRAY_BUFFER, sData.surfPos),
+        sSurfNorm: makeBuf(gl.ARRAY_BUFFER, sData.surfNorm),
+        sSurfKind: makeBuf(gl.ARRAY_BUFFER, sData.surfKind),
+        sSurfIdx: makeBuf(gl.ELEMENT_ARRAY_BUFFER, sData.surfIdx),
+        sSurfCount: sData.surfIdx.length,
+
+        sLinePos: makeBuf(gl.ARRAY_BUFFER, sData.linePos),
+        sLineAlpha: makeBuf(gl.ARRAY_BUFFER, sData.lineAlpha),
+        sLineCount: sData.linePos.length / 3,
+
+        stamenPos: makeBuf(gl.ARRAY_BUFFER, sData.stamenPos),
+        stamenAlpha: makeBuf(gl.ARRAY_BUFFER, sData.stamenAlpha),
+        stamenCount: sData.stamenPos.length / 3,
+
+        antherPos: makeBuf(gl.ARRAY_BUFFER, sData.antherPos),
+        antherSize: makeBuf(gl.ARRAY_BUFFER, sData.antherSize),
+        antherSeed: makeBuf(gl.ARRAY_BUFFER, sData.antherSeed),
+        antherCount: sData.antherSize.length
+      };
+    };
+
+    rebuildFlora();
+
+    const drawSceneCamera = (aspect, rollRad, yawOffset, pitchOverride, pixelRatio) => {
+      const pal = PALETTES[state.palette];
+      const breatheOffset = state.breathe ? Math.sin(state.time * 0.9) * 0.045 : 0.0;
+      const effectiveBloom = Math.max(0.0, Math.min(1.25, state.baseBloom + breatheOffset));
+
+      const yaw = state.yaw + yawOffset;
+      const pitch = pitchOverride !== null ? pitchOverride : state.pitch;
+      const target = [0, -0.22, 0];
+      const cosP = Math.cos(pitch);
+      const eye = [
+        target[0] + state.distance * cosP * Math.sin(yaw),
+        target[1] + state.distance * Math.sin(pitch),
+        target[2] + state.distance * cosP * Math.cos(yaw)
+      ];
+
+      const view = mat4LookAt(eye, target, [0, 1, 0]);
+      let proj = mat4Perspective(0.72, aspect, 0.1, 40.0);
+      if (rollRad !== 0) {
+        proj = mat4Multiply(mat4RotateZ(rollRad), proj);
+      }
+      const viewProj = mat4Multiply(proj, view);
+
+      // Update projected 2D flower hitbox for accurate click detection
+      {
+        const cw = canvas.clientWidth || 1;
+        const ch = canvas.clientHeight || 1;
+        const pts = [
+          [0, 0.25, 0],
+          [0.95, 0.72, 0],
+          [-0.95, 0.72, 0],
+          [0, 0.72, 0.95],
+          [0, 0.72, -0.95],
+          [0, 1.15, 0],
+          [0, -0.75, 0],
+          [0, -1.70, 0]
+        ];
+        let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+        for (const p of pts) {
+          const cx = viewProj[0] * p[0] + viewProj[4] * p[1] + viewProj[8]  * p[2] + viewProj[12];
+          const cy = viewProj[1] * p[0] + viewProj[5] * p[1] + viewProj[9]  * p[2] + viewProj[13];
+          const cw4 = viewProj[3] * p[0] + viewProj[7] * p[1] + viewProj[11] * p[2] + viewProj[15];
+          if (cw4 <= 0.01) continue;
+          const sx = ((cx / cw4) * 0.5 + 0.5) * cw;
+          const sy = (0.5 - (cy / cw4) * 0.5) * ch;
+          if (sx < minX) minX = sx;
+          if (sx > maxX) maxX = sx;
+          if (sy < minY) minY = sy;
+          if (sy > maxY) maxY = sy;
+        }
+        if (minX < Infinity) {
+          flowerHitRect = { minX: minX - 26, maxX: maxX + 26, minY: minY - 26, maxY: maxY + 26 };
+        }
+      }
+
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+      gl.depthMask(false);
+      gl.disable(gl.CULL_FACE);
+
+      // 1. Volumetric Emitter Light Cone
+      gl.useProgram(M_SURF.prog);
+      clearUnusedAttribs([M_SURF.a.aPos, M_SURF.a.aNorm, M_SURF.a.aKind]);
+      bindAttr(M_SURF.a.aPos, pedBuffers.conePos, 3);
+      bindAttr(M_SURF.a.aNorm, pedBuffers.coneNorm, 3);
+      bindAttr(M_SURF.a.aKind, pedBuffers.coneKind, 2);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, pedBuffers.coneIdx);
+      gl.uniformMatrix4fv(M_SURF.u.uViewProj, false, viewProj);
+      gl.uniform3fv(M_SURF.u.uCameraPos, eye);
+      gl.uniform1f(M_SURF.u.uTime, state.time);
+      gl.uniform1f(M_SURF.u.uFloatAmp, 0.0);
+      gl.uniform1f(M_SURF.u.uGlitch, 0.0);
+      gl.uniform1f(M_SURF.u.uScanline, state.scanline);
+      gl.uniform1f(M_SURF.u.uPulse, state.pulseStrength);
+      gl.uniform1f(M_SURF.u.uPulseTime, state.pulseTime);
+      gl.uniform3fv(M_SURF.u.uColorStem, pal.stem);
+      gl.uniform3fv(M_SURF.u.uColorCore, pal.core);
+      gl.uniform3fv(M_SURF.u.uColorOuter, pal.outer);
+      gl.drawElements(gl.TRIANGLES, pedBuffers.coneCount, gl.UNSIGNED_SHORT, 0);
+
+      // 2. Rotating Emitter Pedestal Reticle Rings
+      gl.useProgram(M_LINE.prog);
+      clearUnusedAttribs([M_LINE.a.aPos, M_LINE.a.aLineAlpha]);
+      gl.uniformMatrix4fv(M_LINE.u.uViewProj, false, viewProj);
+      gl.uniform1f(M_LINE.u.uTime, state.time);
+      gl.uniform1f(M_LINE.u.uFloatAmp, 0.0);
+      gl.uniform1f(M_LINE.u.uScanline, state.scanline);
+      gl.uniform3fv(M_LINE.u.uColorLine, pal.outer);
+
+      bindAttr(M_LINE.a.aPos, pedBuffers.outerPos, 3);
+      bindAttr(M_LINE.a.aLineAlpha, pedBuffers.outerAlpha, 1);
+      gl.uniform1f(M_LINE.u.uLocalRotateY, state.time * 0.24);
+      gl.drawArrays(gl.LINES, 0, pedBuffers.outerCount);
+
+      bindAttr(M_LINE.a.aPos, pedBuffers.innerPos, 3);
+      bindAttr(M_LINE.a.aLineAlpha, pedBuffers.innerAlpha, 1);
+      gl.uniform1f(M_LINE.u.uLocalRotateY, -state.time * 0.42);
+      gl.drawArrays(gl.LINES, 0, pedBuffers.innerCount);
+
+      // 3. Stem, Leaves & Core Surface
+      gl.useProgram(M_SURF.prog);
+      clearUnusedAttribs([M_SURF.a.aPos, M_SURF.a.aNorm, M_SURF.a.aKind]);
+      bindAttr(M_SURF.a.aPos, floraBuffers.sSurfPos, 3);
+      bindAttr(M_SURF.a.aNorm, floraBuffers.sSurfNorm, 3);
+      bindAttr(M_SURF.a.aKind, floraBuffers.sSurfKind, 2);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, floraBuffers.sSurfIdx);
+      gl.uniform1f(M_SURF.u.uFloatAmp, 1.0);
+      gl.uniform1f(M_SURF.u.uGlitch, state.glitch);
+      gl.drawElements(gl.TRIANGLES, floraBuffers.sSurfCount, gl.UNSIGNED_SHORT, 0);
+
+      // 4. Stem, Leaves & Stamen Wireframe Lines
+      gl.useProgram(M_LINE.prog);
+      clearUnusedAttribs([M_LINE.a.aPos, M_LINE.a.aLineAlpha]);
+      gl.uniform1f(M_LINE.u.uFloatAmp, 1.0);
+      gl.uniform1f(M_LINE.u.uLocalRotateY, 0.0);
+
+      bindAttr(M_LINE.a.aPos, floraBuffers.sLinePos, 3);
+      bindAttr(M_LINE.a.aLineAlpha, floraBuffers.sLineAlpha, 1);
+      gl.uniform3fv(M_LINE.u.uColorLine, pal.stem);
+      gl.drawArrays(gl.LINES, 0, floraBuffers.sLineCount);
+
+      bindAttr(M_LINE.a.aPos, floraBuffers.stamenPos, 3);
+      bindAttr(M_LINE.a.aLineAlpha, floraBuffers.stamenAlpha, 1);
+      gl.uniform3fv(M_LINE.u.uColorLine, pal.core);
+      gl.drawArrays(gl.LINES, 0, floraBuffers.stamenCount);
+
+      // 5. Hologram Petals Translucent Fresnel Surface
+      gl.useProgram(P_SURF.prog);
+      clearUnusedAttribs([P_SURF.a.aUV, P_SURF.a.aPetalA, P_SURF.a.aPetalB, P_SURF.a.aPetalC]);
+      bindAttr(P_SURF.a.aUV, floraBuffers.pSurfUV, 2);
+      bindAttr(P_SURF.a.aPetalA, floraBuffers.pSurfA, 4);
+      bindAttr(P_SURF.a.aPetalB, floraBuffers.pSurfB, 4);
+      bindAttr(P_SURF.a.aPetalC, floraBuffers.pSurfC, 4);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, floraBuffers.pSurfIdx);
+      gl.uniformMatrix4fv(P_SURF.u.uViewProj, false, viewProj);
+      gl.uniform3fv(P_SURF.u.uCameraPos, eye);
+      gl.uniform1f(P_SURF.u.uTime, state.time);
+      gl.uniform1f(P_SURF.u.uBloom, effectiveBloom);
+      gl.uniform1f(P_SURF.u.uPulse, state.pulseStrength);
+      gl.uniform1f(P_SURF.u.uPulseTime, state.pulseTime);
+      gl.uniform1f(P_SURF.u.uGlitch, state.glitch);
+      gl.uniform1f(P_SURF.u.uScanline, state.scanline);
+      gl.uniform3fv(P_SURF.u.uColorInner, pal.inner);
+      gl.uniform3fv(P_SURF.u.uColorOuter, pal.outer);
+      gl.uniform3fv(P_SURF.u.uColorRim, pal.rim);
+      gl.drawElements(gl.TRIANGLES, floraBuffers.pSurfCount, gl.UNSIGNED_SHORT, 0);
+
+      // 6. Petal Vein & Margin Lattice
+      gl.useProgram(P_LINE.prog);
+      clearUnusedAttribs([P_LINE.a.aUV, P_LINE.a.aPetalA, P_LINE.a.aPetalB, P_LINE.a.aPetalC, P_LINE.a.aLineAlpha]);
+      bindAttr(P_LINE.a.aUV, floraBuffers.pLineUV, 2);
+      bindAttr(P_LINE.a.aPetalA, floraBuffers.pLineA, 4);
+      bindAttr(P_LINE.a.aPetalB, floraBuffers.pLineB, 4);
+      bindAttr(P_LINE.a.aPetalC, floraBuffers.pLineC, 4);
+      bindAttr(P_LINE.a.aLineAlpha, floraBuffers.pLineAlpha, 1);
+      gl.uniformMatrix4fv(P_LINE.u.uViewProj, false, viewProj);
+      gl.uniform1f(P_LINE.u.uTime, state.time);
+      gl.uniform1f(P_LINE.u.uBloom, effectiveBloom);
+      gl.uniform1f(P_LINE.u.uPulse, state.pulseStrength);
+      gl.uniform1f(P_LINE.u.uPulseTime, state.pulseTime);
+      gl.uniform1f(P_LINE.u.uGlitch, state.glitch);
+      gl.uniform1f(P_LINE.u.uScanline, state.scanline);
+      gl.uniform3fv(P_LINE.u.uColorOuter, pal.outer);
+      gl.uniform3fv(P_LINE.u.uColorRim, pal.rim);
+      gl.drawArrays(gl.LINES, 0, floraBuffers.pLineCount);
+
+      // 7. Luminous Stamen Pollen Tips, Core Optical Halos & Drifting Holo-Spores
+      gl.useProgram(PT_PROG.prog);
+      clearUnusedAttribs([PT_PROG.a.aPos, PT_PROG.a.aSize, PT_PROG.a.aSeed]);
+      gl.uniformMatrix4fv(PT_PROG.u.uViewProj, false, viewProj);
+      gl.uniformMatrix4fv(PT_PROG.u.uView, false, view);
+      gl.uniform1f(PT_PROG.u.uTime, state.time);
+      gl.uniform1f(PT_PROG.u.uPixelRatio, pixelRatio);
+      gl.uniform1f(PT_PROG.u.uPulse, state.pulseStrength);
+      gl.uniform1f(PT_PROG.u.uPulseTime, state.pulseTime);
+      gl.uniform3fv(PT_PROG.u.uColorCore, pal.core);
+      gl.uniform3fv(PT_PROG.u.uColorRim, pal.rim);
+
+      bindAttr(PT_PROG.a.aPos, haloBuffers.pos, 3);
+      bindAttr(PT_PROG.a.aSize, haloBuffers.size, 1);
+      bindAttr(PT_PROG.a.aSeed, haloBuffers.seed, 1);
+      gl.uniform1f(PT_PROG.u.uIsSpore, 0.0);
+      gl.uniform1f(PT_PROG.u.uPointAlpha, 0.24);
+      gl.drawArrays(gl.POINTS, 0, haloBuffers.count);
+
+      bindAttr(PT_PROG.a.aPos, floraBuffers.antherPos, 3);
+      bindAttr(PT_PROG.a.aSize, floraBuffers.antherSize, 1);
+      bindAttr(PT_PROG.a.aSeed, floraBuffers.antherSeed, 1);
+      gl.uniform1f(PT_PROG.u.uIsSpore, 0.0);
+      gl.uniform1f(PT_PROG.u.uPointAlpha, 1.0);
+      gl.drawArrays(gl.POINTS, 0, floraBuffers.antherCount);
+
+      bindAttr(PT_PROG.a.aPos, sporeBuffers.pos, 3);
+      bindAttr(PT_PROG.a.aSize, sporeBuffers.size, 1);
+      bindAttr(PT_PROG.a.aSeed, sporeBuffers.seed, 1);
+      gl.uniform1f(PT_PROG.u.uIsSpore, 1.0);
+      gl.uniform1f(PT_PROG.u.uPointAlpha, 0.92);
+      gl.drawArrays(gl.POINTS, 0, sporeBuffers.count);
+    };
+
+    const render = () => {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+      const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+      if (canvas.width !== w || canvas.height !== h) {
+        canvas.width = w;
+        canvas.height = h;
+      }
+
+      gl.disable(gl.SCISSOR_TEST);
+      gl.viewport(0, 0, w, h);
+      gl.clearColor(0, 0, 0, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+      const pal = PALETTES[state.palette];
+      gl.disable(gl.BLEND);
+      gl.useProgram(BG_PROG.prog);
+      clearUnusedAttribs([BG_PROG.a.aQuad]);
+      bindAttr(BG_PROG.a.aQuad, bgQuadBuf, 2);
+      gl.uniform3fv(BG_PROG.u.uColorInner, pal.inner);
+      gl.uniform3fv(BG_PROG.u.uColorOuter, pal.outer);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+      drawSceneCamera(w / h, 0, 0, null, dpr);
+    };
+
+    return { render, rebuildFlora };
+  }
+
+  function createFallback2DRenderer() {
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return { render: () => {}, rebuildFlora: () => {} };
+
+    const render = () => {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+      const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+      if (canvas.width !== w || canvas.height !== h) {
+        canvas.width = w;
+        canvas.height = h;
+      }
+      ctx.clearRect(0, 0, w, h);
+      ctx.save();
+      ctx.translate(w * 0.5, h * 0.52);
+      ctx.globalCompositeOperation = 'lighter';
+
+      const pal = PALETTES[state.palette];
+      const scale = Math.min(w, h) * 0.25;
+      const count = state.species === 'lily' ? 6 : 12;
+      const open = 0.4 + state.baseBloom * 0.6;
+
+      for (let tier = 0; tier < 3; tier++) {
+        const n = count + tier * 2;
+        const rad = scale * (0.45 + tier * 0.28) * open;
+        for (let i = 0; i < n; i++) {
+          const a = (i / n) * Math.PI * 2 + state.yaw + tier * 0.4;
+          ctx.save();
+          ctx.rotate(a);
+          ctx.beginPath();
+          ctx.moveTo(0, 0);
+          ctx.bezierCurveTo(rad * 0.32, -rad * 0.45, rad * 0.22, -rad * 0.9, 0, -rad);
+          ctx.bezierCurveTo(-rad * 0.22, -rad * 0.9, -rad * 0.32, -rad * 0.45, 0, 0);
+          ctx.strokeStyle = pal.accent;
+          ctx.lineWidth = 1.6 * dpr;
+          ctx.globalAlpha = 0.45;
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
+      ctx.restore();
+    };
+
+    return { render, rebuildFlora: () => {} };
+  }
+
+  const renderer = createWebGLRenderer() || createFallback2DRenderer();
+
+  /* =========================================================================
+   * Animation Loop
+   * ========================================================================= */
+  let lastTs = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.05, Math.max(0.001, (now - lastTs) * 0.001));
+    lastTs = now;
+
+    state.time += dt;
+
+    if (pointers.size === 0) {
+      state.yaw += state.velYaw;
+      state.pitch = Math.max(-0.55, Math.min(1.38, state.pitch + state.velPitch));
+      state.velYaw *= 0.92;
+      state.velPitch *= 0.92;
+      if (state.autoOrbit) {
+        state.yaw += dt * 0.28;
+      }
+    }
+
+    if (state.pulseStrength > 0.001) {
+      state.pulseTime += dt;
+      state.pulseStrength = Math.max(0, state.pulseStrength - dt * 0.58);
+    }
+
+    renderer.render();
+    requestAnimationFrame(frame);
+  }
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
